@@ -673,11 +673,32 @@ func (a *AuthServer) ValidateOIDCAuthCallback(q url.Values) (*OIDCAuthResponse, 
 		return response, nil
 	}
 
-	user, err := a.Identity.GetUserByOIDCIdentity(services.OIDCIdentity{
+	var user services.User
+
+	user, err = a.Identity.GetUserByOIDCIdentity(services.OIDCIdentity{
 		ConnectorID: req.ConnectorID, Email: ident.Email})
 	if err != nil {
-		return nil, trace.Wrap(err)
+		stoken, err := a.CreateSignupToken(&services.TeleportUser{
+			Name:           response.Identity.Email,
+			AllowedLogins:  []string{connector.DefaultLogin},
+			OIDCIdentities: []services.OIDCIdentity{response.Identity},
+		})
+
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		// [Tehsis] TODO: do something with the password
+		_, err = a.CreateUserWithToken(stoken, "default", "")
+
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		user, err = a.Identity.GetUserByOIDCIdentity(services.OIDCIdentity{
+			ConnectorID: req.ConnectorID, Email: ident.Email})
 	}
+
 	response.Username = user.GetName()
 
 	if req.CreateWebSession {

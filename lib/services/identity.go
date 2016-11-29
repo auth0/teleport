@@ -274,7 +274,8 @@ type OIDCConnector struct {
 	// Should match the URL on Provider's side
 	RedirectURL string `json:"redirect_url"`
 	// Display - Friendly name for this provider.
-	Display string `json:"display"`
+	Display      string `json:"display"`
+	DefaultLogin string `json:"default_login"`
 }
 
 // Check returns nil if all parameters are great, err otherwise

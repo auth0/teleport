@@ -577,8 +577,9 @@ type OIDCConnector struct {
 	// RedirectURL - Identity provider will use this URL to redirect
 	// client's browser back to it after successfull authentication
 	// Should match the URL on Provider's side
-	RedirectURL string `yaml:"redirect_url"`
-	Display     string `yaml:"display"`
+	RedirectURL  string `yaml:"redirect_url"`
+	Display      string `yaml:"display"`
+	DefaultLogin string `yaml:"default_login"`
 }
 
 // Parse parses config struct into services connector and checks if it's valid
@@ -590,6 +591,7 @@ func (o *OIDCConnector) Parse() (*services.OIDCConnector, error) {
 	other := &services.OIDCConnector{
 		ID:           o.ID,
 		Display:      o.Display,
+		DefaultLogin: o.DefaultLogin,
 		IssuerURL:    o.IssuerURL,
 		ClientID:     o.ClientID,
 		ClientSecret: o.ClientSecret,
