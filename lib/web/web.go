@@ -231,9 +231,14 @@ func (m *Handler) Close() error {
 	return m.auth.Close()
 }
 
+type oidcConnector struct {
+	ID      string `json:"id"`
+	Display string `json:"display"`
+}
+
 type webSettings struct {
 	Auth struct {
-		OIDCConnectors []string `json:"oidc_connectors"`
+		OIDCConnectors []oidcConnector `json:"oidc_connectors"`
 	} `json:"auth"`
 }
 
@@ -243,11 +248,17 @@ func (m *Handler) getSettings(w http.ResponseWriter, r *http.Request) (interface
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	for _, connector := range connectors {
-		settings.Auth.OIDCConnectors = append(settings.Auth.OIDCConnectors, connector.ID)
+		fmt.Printf("%v\n", connectors)
+		settings.Auth.OIDCConnectors = append(settings.Auth.OIDCConnectors, oidcConnector{
+			ID:      connector.ID,
+			Display: connector.Display,
+		})
 	}
+
 	if len(settings.Auth.OIDCConnectors) == 0 {
-		settings.Auth.OIDCConnectors = make([]string, 0)
+		settings.Auth.OIDCConnectors = make([]oidcConnector, 0)
 	}
 	out, err := json.Marshal(settings)
 	if err != nil {
