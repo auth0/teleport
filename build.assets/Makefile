@@ -60,3 +60,7 @@ run-docs: bbox
 .PHONY:enter
 enter: bbox
 	docker run $(DOCKERFLAGS) -ti $(NOROOT) $(BBOX) /bin/bash
+
+.PHONY:release
+release: 
+	docker run $(DOCKERFLAGS) -ti $(NOROOT) $(BBOX) /usr/bin/make release
