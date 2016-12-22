@@ -64,3 +64,8 @@ enter: bbox
 .PHONY:release
 release: 
 	docker run $(DOCKERFLAGS) -i $(NOROOT) $(BBOX) /usr/bin/make release -e VERSION="$(VERSION)" -e ADDFLAGS="$(ADDFLAGS)"
+
+.PHONY:docker-test
+docker-test: 
+	docker run $(DOCKERFLAGS) -i $(NOROOT) $(BBOX) /usr/bin/make test
+>>>>>>> Added task to test with docker
