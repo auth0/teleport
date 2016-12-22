@@ -99,7 +99,7 @@ func (s *AuthServer) CreateSignupToken(user services.User) (string, error) {
 		return "", trace.Wrap(err)
 	}
 
-	log.Infof("[AUTH API] created the signup token for %v as %v", user)
+	log.Infof("[AUTH API] created the signup token for %v as %v", user, token)
 	return token, nil
 }
 
@@ -158,9 +158,11 @@ func (s *AuthServer) CreateUserWithToken(token, password, hotpToken string) (*Se
 		return nil, trace.Wrap(err)
 	}
 
-	ok := otp.Scan(hotpToken, defaults.HOTPFirstTokensRange)
-	if !ok {
-		return nil, trace.BadParameter("wrong HOTP token")
+	if hotpToken != "" {
+		ok := otp.Scan(hotpToken, defaults.HOTPFirstTokensRange)
+		if !ok {
+			return nil, trace.BadParameter("wrong HOTP token")
+		}
 	}
 
 	_, _, err = s.UpsertPassword(tokenData.User.GetName(), []byte(password))
