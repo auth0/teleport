@@ -68,4 +68,3 @@ release:
 .PHONY:docker-test
 docker-test: 
 	docker run $(DOCKERFLAGS) -i $(NOROOT) $(BBOX) /usr/bin/make test
->>>>>>> Added task to test with docker
