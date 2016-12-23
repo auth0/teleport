@@ -132,6 +132,40 @@ func (s *AuthServer) GetSignupTokenData(token string) (user string,
 	return tokenData.User.GetName(), tokenData.HotpQR, tokenData.HotpFirstValues, nil
 }
 
+func (s *AuthServer) CreateUserFromOidc(user services.TeleportUser) (*Session, error) {
+	err := s.AcquireLock("signuptoken"+user.GetName(), time.Hour)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	defer func() {
+		err := s.ReleaseLock("signuptoken" + user.GetName())
+		if err != nil {
+			log.Errorf(err.Error())
+		}
+	}()
+
+	// apply user allowed logins
+	if err = s.UpsertUser(&user); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	log.Infof("[AUTH] created new user: %v", &user)
+
+	sess, err := s.NewWebSession(user.GetName())
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	err = s.UpsertWebSession(user.GetName(), sess, WebSessionTTL)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	sess.WS.Priv = nil
+	return sess, nil
+}
+
 // CreateUserWithToken creates account with provided token and password.
 // Account username and hotp generator are taken from token data.
 // Deletes token after account creation.
@@ -158,11 +192,9 @@ func (s *AuthServer) CreateUserWithToken(token, password, hotpToken string) (*Se
 		return nil, trace.Wrap(err)
 	}
 
-	if hotpToken != "" {
-		ok := otp.Scan(hotpToken, defaults.HOTPFirstTokensRange)
-		if !ok {
-			return nil, trace.BadParameter("wrong HOTP token")
-		}
+	ok := otp.Scan(hotpToken, defaults.HOTPFirstTokensRange)
+	if !ok {
+		return nil, trace.BadParameter("wrong HOTP token")
 	}
 
 	_, _, err = s.UpsertPassword(tokenData.User.GetName(), []byte(password))

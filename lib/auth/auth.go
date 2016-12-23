@@ -678,18 +678,12 @@ func (a *AuthServer) ValidateOIDCAuthCallback(q url.Values) (*OIDCAuthResponse, 
 	user, err = a.Identity.GetUserByOIDCIdentity(services.OIDCIdentity{
 		ConnectorID: req.ConnectorID, Email: ident.Email})
 	if err != nil {
-		stoken, err := a.CreateSignupToken(&services.TeleportUser{
+
+		_, err = a.CreateUserFromOidc(services.TeleportUser{
 			Name:           response.Identity.Email,
 			AllowedLogins:  []string{connector.DefaultLogin},
 			OIDCIdentities: []services.OIDCIdentity{response.Identity},
 		})
-
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-
-		// [Tehsis] TODO: do something with the password
-		_, err = a.CreateUserWithToken(stoken, "default", "")
 
 		if err != nil {
 			return nil, trace.Wrap(err)
