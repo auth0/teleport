@@ -17,11 +17,9 @@ limitations under the License.
 package service
 
 import (
-	"fmt"
 	"io"
 	"net"
 	"os"
-	"strings"
 
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/backend"
@@ -209,7 +207,12 @@ type AuthConfig struct {
 	// NoAudit, when set to true, disables session recording and event audit
 	NoAudit bool
 
-	U2F services.U2F
+	// Preference defines the authentication preference (type and second factor) for
+	// the auth server.
+	Preference services.AuthPreference
+
+	// U2F defines is settings for Universal Second Factor (appID and facets).
+	U2F services.UniversalSecondFactor
 }
 
 // SSHConfig configures SSH server node role
@@ -247,12 +250,13 @@ func ApplyDefaults(cfg *Config) {
 	// defaults for the auth service:
 	cfg.Auth.Enabled = true
 	cfg.Auth.SSHAddr = *defaults.AuthListenAddr()
-	cfg.Auth.U2F.Enabled = false
-	cfg.Auth.U2F.AppID = fmt.Sprintf("https://%s:%d", strings.ToLower(hostname), defaults.HTTPListenPort)
-	cfg.Auth.U2F.Facets = []string{cfg.Auth.U2F.AppID}
 	cfg.Auth.StorageConfig.Type = boltbk.GetName()
 	cfg.Auth.StorageConfig.Params = backend.Params{"path": cfg.DataDir}
 	defaults.ConfigureLimiter(&cfg.Auth.Limiter)
+	// set new style default auth preferences
+	ap := &services.AuthPreferenceV2{}
+	ap.CheckAndSetDefaults()
+	cfg.Auth.Preference = ap
 
 	// defaults for the SSH proxy service:
 	cfg.Proxy.Enabled = true

@@ -17,14 +17,20 @@ limitations under the License.
 package auth
 
 import (
+	"io/ioutil"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
+	"github.com/gravitational/teleport/lib/backend"
+	"github.com/gravitational/teleport/lib/backend/boltbk"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
-	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/trace"
+
 	. "gopkg.in/check.v1"
 )
 
@@ -44,7 +50,15 @@ func (s *AuthInitSuite) TestReadIdentity(c *C) {
 	priv, pub, err := t.GenerateKeyPair("")
 	c.Assert(err, IsNil)
 
-	cert, err := t.GenerateHostCert(priv, pub, "id1", "example.com", teleport.Roles{teleport.RoleNode}, 0)
+	cert, err := t.GenerateHostCert(services.CertParams{
+		PrivateCASigningKey: priv,
+		PublicHostKey:       pub,
+		HostID:              "id1",
+		NodeName:            "node-name",
+		ClusterName:         "example.com",
+		Roles:               teleport.Roles{teleport.RoleNode},
+		TTL:                 0,
+	})
 	c.Assert(err, IsNil)
 
 	id, err := ReadIdentityFromKeyPair(priv, cert)
@@ -57,7 +71,15 @@ func (s *AuthInitSuite) TestReadIdentity(c *C) {
 	// test TTL by converting the generated cert to text -> back and making sure ExpireAfter is valid
 	ttl := time.Second * 10
 	expiryDate := time.Now().Add(ttl)
-	bytes, err := t.GenerateHostCert(priv, pub, "id1", "example.com", teleport.Roles{teleport.RoleNode}, ttl)
+	bytes, err := t.GenerateHostCert(services.CertParams{
+		PrivateCASigningKey: priv,
+		PublicHostKey:       pub,
+		HostID:              "id1",
+		NodeName:            "node-name",
+		ClusterName:         "example.com",
+		Roles:               teleport.Roles{teleport.RoleNode},
+		TTL:                 ttl,
+	})
 	c.Assert(err, IsNil)
 	pk, _, _, _, err := ssh.ParseAuthorizedKey(bytes)
 	c.Assert(err, IsNil)
@@ -76,23 +98,80 @@ func (s *AuthInitSuite) TestBadIdentity(c *C) {
 	c.Assert(trace.IsBadParameter(err), Equals, true, Commentf("%#v", err))
 
 	// missing authority domain
-	cert, err := t.GenerateHostCert(priv, pub, "", "id2", teleport.Roles{teleport.RoleNode}, 0)
+	cert, err := t.GenerateHostCert(services.CertParams{
+		PrivateCASigningKey: priv,
+		PublicHostKey:       pub,
+		HostID:              "id2",
+		NodeName:            "",
+		ClusterName:         "",
+		Roles:               teleport.Roles{teleport.RoleNode},
+		TTL:                 0,
+	})
 	c.Assert(err, IsNil)
 
 	_, err = ReadIdentityFromKeyPair(priv, cert)
 	c.Assert(trace.IsBadParameter(err), Equals, true, Commentf("%#v", err))
 
 	// missing host uuid
-	cert, err = t.GenerateHostCert(priv, pub, "example.com", "", teleport.Roles{teleport.RoleNode}, 0)
+	cert, err = t.GenerateHostCert(services.CertParams{
+		PrivateCASigningKey: priv,
+		PublicHostKey:       pub,
+		HostID:              "example.com",
+		NodeName:            "",
+		ClusterName:         "",
+		Roles:               teleport.Roles{teleport.RoleNode},
+		TTL:                 0,
+	})
 	c.Assert(err, IsNil)
 
 	_, err = ReadIdentityFromKeyPair(priv, cert)
 	c.Assert(trace.IsBadParameter(err), Equals, true, Commentf("%#v", err))
 
 	// unrecognized role
-	cert, err = t.GenerateHostCert(priv, pub, "example.com", "id1", teleport.Roles{teleport.Role("bad role")}, 0)
+	cert, err = t.GenerateHostCert(services.CertParams{
+		PrivateCASigningKey: priv,
+		PublicHostKey:       pub,
+		HostID:              "example.com",
+		NodeName:            "",
+		ClusterName:         "id1",
+		Roles:               teleport.Roles{teleport.Role("bad role")},
+		TTL:                 0,
+	})
 	c.Assert(err, IsNil)
 
 	_, err = ReadIdentityFromKeyPair(priv, cert)
 	c.Assert(trace.IsBadParameter(err), Equals, true, Commentf("%#v", err))
+}
+
+// TestAuthPreference ensures that the act of creating an AuthServer sets
+// the AuthPreference (type and second factor) on the backend.
+func (s *AuthInitSuite) TestAuthPreference(c *C) {
+	tempDir, err := ioutil.TempDir("", "auth-test-")
+	c.Assert(err, IsNil)
+
+	bk, err := boltbk.New(backend.Params{"path": tempDir})
+	c.Assert(err, IsNil)
+
+	ap, err := services.NewAuthPreference(services.AuthPreferenceSpecV2{
+		Type:         "local",
+		SecondFactor: "u2f",
+	})
+	c.Assert(err, IsNil)
+
+	ac := InitConfig{
+		DataDir:        tempDir,
+		HostUUID:       "00000000-0000-0000-0000-000000000000",
+		NodeName:       "foo",
+		Backend:        bk,
+		Authority:      testauthority.New(),
+		DomainName:     "me.localhost",
+		AuthPreference: ap,
+	}
+	as, _, err := Init(ac, true)
+	c.Assert(err, IsNil)
+
+	cap, err := as.GetClusterAuthPreference()
+	c.Assert(err, IsNil)
+	c.Assert(cap.GetType(), Equals, "local")
+	c.Assert(cap.GetSecondFactor(), Equals, "u2f")
 }

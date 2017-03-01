@@ -23,7 +23,6 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/teleport"
 	authority "github.com/gravitational/teleport/lib/auth/native"
 	"github.com/gravitational/teleport/lib/backend"
@@ -37,6 +36,7 @@ import (
 	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/jonboulle/clockwork"
 	"github.com/kylelemons/godebug/diff"
 	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/ssh"
@@ -83,23 +83,24 @@ func (s *APISuite) SetUpTest(c *C) {
 	s.sessions, err = session.New(s.bk)
 	c.Assert(err, IsNil)
 
+	// use a fake clock during tests for stability
+	s.a.clock = clockwork.NewFakeClock()
+
 	s.AccessS = local.NewAccessService(s.bk)
 	s.WebS = local.NewIdentityService(s.bk)
 
-	newChecker, err := NewAccessChecker(s.AccessS, s.WebS)
+	authorizer, err := NewRoleAuthorizer(teleport.RoleAdmin)
 	c.Assert(err, IsNil)
 
 	apiServer := NewAPIServer(&APIConfig{
 		AuthServer:     s.a,
-		NewChecker:     newChecker,
+		Authorizer:     authorizer,
 		SessionService: s.sessions,
 		AuditLog:       s.alog,
 	})
 	s.srv = httptest.NewServer(apiServer)
 
-	// apiserver receives authentication information passed by SSH,
-	// this is to pass auth info to auth user
-	clt, err := NewClient(s.srv.URL, nil, roundtrip.BasicAuth(teleport.RoleAdmin.User(), "<something>"))
+	clt, err := NewClient(s.srv.URL, nil)
 	c.Assert(err, IsNil)
 	s.clt = clt
 
@@ -158,8 +159,9 @@ func (s *APISuite) TestGenerateKeysAndCerts(c *C) {
 	c.Assert(err, IsNil)
 
 	// make sure we can parse the private and public key
-	cert, err := s.clt.GenerateHostCert(
-		pub, "localhost", "localhost", teleport.Roles{teleport.RoleNode}, time.Hour)
+	cert, err := s.clt.GenerateHostCert(pub,
+		"00000000-0000-0000-0000-000000000000", "localhost", "localhost",
+		teleport.Roles{teleport.RoleNode}, time.Hour)
 	c.Assert(err, IsNil)
 
 	_, _, _, _, err = ssh.ParseAuthorizedKey(cert)
@@ -178,45 +180,55 @@ func (s *APISuite) TestGenerateKeysAndCerts(c *C) {
 	err = s.clt.UpsertPassword(user2.GetName(), []byte("abc1232"))
 	c.Assert(err, IsNil)
 
-	newChecker, err := NewAccessChecker(s.AccessS, s.WebS)
+	// unauthenticated client should NOT be able to generate a user cert without auth
+	authorizer, err := NewAuthorizer(s.AccessS, s.WebS, s.CAS)
 	c.Assert(err, IsNil)
-
-	userServer := NewAPIServer(&APIConfig{
-		AuthServer:     s.a,
-		NewChecker:     newChecker,
-		SessionService: s.sessions,
-		AuditLog:       s.alog,
-	})
-	authServer := httptest.NewServer(userServer)
+	authServer, userClient := s.newServerWithAuthorizer(c, authorizer)
 	defer authServer.Close()
 
-	userClient, err := NewClient(authServer.URL, nil)
-	c.Assert(err, IsNil)
-
-	// should NOT be able to generate a user cert without basic HTTP auth
 	cert, err = userClient.GenerateUserCert(pub, "user1", time.Hour)
 	c.Assert(err, NotNil)
-	c.Assert(err, ErrorMatches, ".*username or password")
+	c.Assert(err.Error(), Equals, "auth API: access denied [00]")
 
 	// Users don't match
-	roundtrip.BasicAuth("user2", "two")(&userClient.Client)
-	cert, err = userClient.GenerateUserCert(pub, "user1", time.Hour)
+	authorizer, err = NewUserAuthorizer("user2", s.WebS, s.AccessS)
+	c.Assert(err, IsNil)
+	authServer2, userClient2 := s.newServerWithAuthorizer(c, authorizer)
+	defer authServer2.Close()
+
+	cert, err = userClient2.GenerateUserCert(pub, "user1", time.Hour)
 	c.Assert(err, NotNil)
 	c.Assert(err, ErrorMatches, ".*cannot request a certificate for user1")
 
 	// should not be able to generate cert for longer than duration
-	roundtrip.BasicAuth("user1", "two")(&userClient.Client)
-	cert, err = userClient.GenerateUserCert(pub, "user1", 40*time.Hour)
+	authorizer, err = NewUserAuthorizer("user1", s.WebS, s.AccessS)
+	c.Assert(err, IsNil)
+	authServer3, userClient3 := s.newServerWithAuthorizer(c, authorizer)
+	defer authServer3.Close()
+
+	cert, err = userClient3.GenerateUserCert(pub, "user1", 40*time.Hour)
 	c.Assert(err, NotNil)
 	c.Assert(err, ErrorMatches, ".*cannot request a certificate for 40h0m0s")
 
 	// apply HTTP Auth to generate user cert:
-	roundtrip.BasicAuth("user1", "two")(&userClient.Client)
-	cert, err = userClient.GenerateUserCert(pub, "user1", time.Hour)
+	cert, err = userClient3.GenerateUserCert(pub, "user1", time.Hour)
 	c.Assert(err, IsNil)
 
 	_, _, _, _, err = ssh.ParseAuthorizedKey(cert)
 	c.Assert(err, IsNil)
+}
+
+func (s *APISuite) newServerWithAuthorizer(c *C, authz Authorizer) (*httptest.Server, *Client) {
+	userServer := NewAPIServer(&APIConfig{
+		AuthServer:     s.a,
+		Authorizer:     authz,
+		SessionService: s.sessions,
+		AuditLog:       s.alog,
+	})
+	authServer := httptest.NewServer(userServer)
+	userClient, err := NewClient(authServer.URL, nil)
+	c.Assert(err, IsNil)
+	return authServer, userClient
 }
 
 func (s *APISuite) TestUserCRUD(c *C) {
@@ -248,7 +260,8 @@ func (s *APISuite) TestPasswordCRUD(c *C) {
 
 	err = s.a.UpsertTOTP("user1", otpSecret)
 	c.Assert(err, IsNil)
-	validToken, err := totp.GenerateCode(otpSecret, time.Now())
+
+	validToken, err := totp.GenerateCode(otpSecret, s.a.clock.Now())
 	c.Assert(err, IsNil)
 
 	err = s.clt.CheckPassword("user1", pass, validToken)
@@ -278,15 +291,20 @@ func (s *APISuite) TestOTPCRUD(c *C) {
 	err = s.clt.CheckPassword("user1", pass, "123456")
 	c.Assert(err, NotNil)
 
-	// a invalid token (made 1 minute in the future but from a valid key)
-	// should also return access denied
-	invalidToken, err := totp.GenerateCode(otpSecret, time.Now().Add(1*time.Minute))
+	// an invalid token should return access denied
+	//
+	// this tests makes the token 61 seconds in the future (but from a valid key)
+	// even though the validity period is 30 seconds. this is because a token is
+	// valid for 30 seconds + 30 second skew before and after for a usability
+	// reasons. so a token made between seconds 31 and 60 is still valid, and
+	// invalidity starts at 61 seconds in the future.
+	invalidToken, err := totp.GenerateCode(otpSecret, s.a.clock.Now().Add(61*time.Second))
 	c.Assert(err, IsNil)
 	err = s.clt.CheckPassword("user1", pass, invalidToken)
 	c.Assert(err, NotNil)
 
 	// a valid token (created right now and from a valid key) should return success
-	validToken, err := totp.GenerateCode(otpSecret, time.Now())
+	validToken, err := totp.GenerateCode(otpSecret, s.a.clock.Now())
 	c.Assert(err, IsNil)
 
 	err = s.clt.CheckPassword("user1", pass, validToken)
@@ -328,21 +346,21 @@ func (s *APISuite) TestSessions(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(ws, Not(Equals), "")
 
-	out, err := s.clt.GetWebSessionInfo(user, ws.ID)
+	out, err := s.clt.GetWebSessionInfo(user, ws.GetName())
 	c.Assert(err, IsNil)
 	c.Assert(out, DeepEquals, ws)
 
-	new, err := s.clt.ExtendWebSession(user, ws.ID)
+	new, err := s.clt.ExtendWebSession(user, ws.GetName())
 	c.Assert(err, IsNil)
 	c.Assert(new, NotNil)
 
-	err = s.clt.DeleteWebSession(user, ws.ID)
+	err = s.clt.DeleteWebSession(user, ws.GetName())
 	c.Assert(err, IsNil)
 
-	_, err = s.clt.GetWebSessionInfo(user, ws.ID)
+	_, err = s.clt.GetWebSessionInfo(user, ws.GetName())
 	c.Assert(err, NotNil)
 
-	_, err = s.clt.ExtendWebSession(user, ws.ID)
+	_, err = s.clt.ExtendWebSession(user, ws.GetName())
 	c.Assert(err, NotNil)
 }
 

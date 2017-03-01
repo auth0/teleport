@@ -19,6 +19,7 @@ package srv
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -71,6 +72,7 @@ type SrvSuite struct {
 	freePorts     utils.PortList
 	access        services.Access
 	identity      services.Identity
+	trust         services.Trust
 }
 
 var _ = Suite(&SrvSuite{})
@@ -98,6 +100,7 @@ func (s *SrvSuite) SetUpTest(c *C) {
 
 	s.access = local.NewAccessService(s.bk)
 	s.identity = local.NewIdentityService(s.bk)
+	s.trust = local.NewCAService(s.bk)
 
 	s.domainName = "localhost"
 	s.a = auth.NewAuthServer(&auth.InitConfig{
@@ -112,7 +115,7 @@ func (s *SrvSuite) SetUpTest(c *C) {
 	s.sessionServer = sessionServer
 	c.Assert(err, IsNil)
 
-	newChecker, err := auth.NewAccessChecker(s.access, s.identity)
+	authorizer, err := auth.NewAuthorizer(s.access, s.identity, s.trust)
 	c.Assert(err, IsNil)
 
 	c.Assert(s.a.UpsertCertAuthority(suite.NewTestCA(services.UserCA, s.domainName), backend.Forever), IsNil)
@@ -122,15 +125,16 @@ func (s *SrvSuite) SetUpTest(c *C) {
 	up, err := newUpack(s.user, []string{s.user}, s.a)
 	c.Assert(err, IsNil)
 
-	checker, err := newChecker(s.user)
+	ctx := context.WithValue(context.TODO(), teleport.ContextUser, teleport.LocalUser{Username: s.user})
+	authContext, err := authorizer.Authorize(ctx)
 	c.Assert(err, IsNil)
 
-	s.roleAuth = auth.NewAuthWithRoles(s.a, checker, s.user, sessionServer, nil)
+	s.roleAuth = auth.NewAuthWithRoles(s.a, authContext.Checker, s.user, sessionServer, nil)
 
 	// set up host private key and certificate
 	hpriv, hpub, err := s.a.GenerateKeyPair("")
 	c.Assert(err, IsNil)
-	hcert, err := s.a.GenerateHostCert(hpub, s.domainName, s.domainName, teleport.Roles{teleport.RoleAdmin}, 0)
+	hcert, err := s.a.GenerateHostCert(hpub, "00000000-0000-0000-0000-000000000000", s.domainName, s.domainName, teleport.Roles{teleport.RoleAdmin}, 0)
 	c.Assert(err, IsNil)
 
 	// set up user CA and set up a user that has access to the server
@@ -324,10 +328,10 @@ func (s *SrvSuite) testClient(c *C, proxyAddr, targetAddr, remoteAddr string, ss
 	c.Assert(err, IsNil)
 	defer se2.Close()
 
-	out, err := se2.Output("echo $((2+3))")
+	out, err := se2.Output("echo hello")
 	c.Assert(err, IsNil)
 
-	c.Assert(strings.Trim(string(out), " \n"), Equals, "5")
+	c.Assert(string(out), Equals, "hello\n")
 }
 
 func (s *SrvSuite) TestProxyReverseTunnel(c *C) {
@@ -835,7 +839,7 @@ func removeNL(v string) string {
 }
 
 func (s *SrvSuite) makeTunnel(c *C) *auth.AuthTunnel {
-	newChecker, err := auth.NewAccessChecker(s.access, s.identity)
+	authorizer, err := auth.NewAuthorizer(s.access, s.identity, s.trust)
 	c.Assert(err, IsNil)
 
 	tsrv, err := auth.NewTunnel(
@@ -845,7 +849,7 @@ func (s *SrvSuite) makeTunnel(c *C) *auth.AuthTunnel {
 			AuthServer:     s.a,
 			AuditLog:       s.alog,
 			SessionService: s.sessionServer,
-			NewChecker:     newChecker,
+			Authorizer:     authorizer,
 		})
 	c.Assert(err, IsNil)
 	return tsrv

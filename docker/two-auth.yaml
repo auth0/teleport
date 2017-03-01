@@ -1,0 +1,33 @@
+# Auth server for cluster "two". Also runs "node" role
+teleport:
+  nodename: two-auth
+  log:
+    output: /var/lib/teleport/teleport.log
+    severity: INFO
+
+auth_service:
+  enabled: yes
+  cluster_name: two
+  tokens: 
+       - "node,auth,proxy:xxx"
+  listen_addr: 172.10.1.2:3025
+
+  # to enable trusted clusters, execute `tctl auth export > data/one.ca` inside container "one"
+  # and then restart container "two-auth"
+  trusted_clusters:
+       - key_file: /root/go/src/github.com/gravitational/teleport/docker/data/one/one.ca
+         allow_logins: root
+         tunnel_addr: one
+
+ssh_service:
+  enabled: yes
+  labels:
+      cluster: two
+      role: auth+node
+  commands:
+      - name: kernel
+        command: [/bin/uname, -r]
+        period: 5m
+
+proxy_service:
+  enabled: no

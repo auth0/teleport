@@ -78,13 +78,13 @@ func (s *InstanceSecrets) String() string {
 }
 
 // NewInstance creates a new Teleport process instance
-func NewInstance(siteName string, hostName string, ports []int, priv, pub []byte) *TeleInstance {
+func NewInstance(clusterName string, hostID string, nodeName string, ports []int, priv, pub []byte) *TeleInstance {
 	var err error
 	if len(ports) < 5 {
 		fatalIf(fmt.Errorf("not enough free ports given: %v", ports))
 	}
-	if hostName == "" {
-		hostName, err = os.Hostname()
+	if nodeName == "" {
+		nodeName, err = os.Hostname()
 		fatalIf(err)
 	}
 	// generate instance secrets (keys):
@@ -92,21 +92,28 @@ func NewInstance(siteName string, hostName string, ports []int, priv, pub []byte
 	if priv == nil || pub == nil {
 		priv, pub, _ = keygen.GenerateKeyPair("")
 	}
-	cert, err := keygen.GenerateHostCert(priv, pub,
-		hostName, siteName, teleport.Roles{teleport.RoleAdmin}, time.Duration(time.Hour*24))
+	cert, err := keygen.GenerateHostCert(services.CertParams{
+		PrivateCASigningKey: priv,
+		PublicHostKey:       pub,
+		HostID:              hostID,
+		NodeName:            nodeName,
+		ClusterName:         clusterName,
+		Roles:               teleport.Roles{teleport.RoleAdmin},
+		TTL:                 time.Duration(time.Hour * 24),
+	})
 	fatalIf(err)
 	secrets := InstanceSecrets{
-		SiteName:   siteName,
+		SiteName:   clusterName,
 		PrivKey:    priv,
 		PubKey:     pub,
 		Cert:       cert,
-		ListenAddr: net.JoinHostPort(hostName, strconv.Itoa(ports[4])),
+		ListenAddr: net.JoinHostPort(nodeName, strconv.Itoa(ports[4])),
 		Users:      make(map[string]*User),
 	}
 	return &TeleInstance{
 		Secrets:  secrets,
 		Ports:    ports,
-		Hostname: hostName,
+		Hostname: nodeName,
 	}
 }
 
@@ -354,7 +361,8 @@ func (i *TeleInstance) Start() (err error) {
 	return err
 }
 
-// NewClient returns a fully configured client (with server CAs and user keys)
+// NewClient returns a fully configured and pre-authenticated client
+// (pre-authenticated with server CAs and signed session key)
 func (i *TeleInstance) NewClient(login string, site string, host string, port int) (tc *client.TeleportClient, err error) {
 	keyDir, err := ioutil.TempDir(i.Config.DataDir, "tsh")
 	if err != nil {
@@ -394,7 +402,7 @@ func (i *TeleInstance) NewClient(login string, site string, host string, port in
 	if err != nil {
 		return nil, err
 	}
-	// tells the client to use user keys from 'secrets':
+	// confnigures the client authenticate using the keys from 'secrets':
 	user, ok := i.Secrets.Users[login]
 	if !ok {
 		return nil, trace.Errorf("unknown login '%v'", login)
@@ -402,11 +410,12 @@ func (i *TeleInstance) NewClient(login string, site string, host string, port in
 	if user.Key == nil {
 		return nil, trace.Errorf("user %v has no key", login)
 	}
-	err = tc.AddKey(host, user.Key)
+	_, err = tc.AddKey(host, user.Key)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	// tell the client to trust given CAs (from secrets)
+	// tell the client to trust given CAs (from secrets). this is the
+	// equivalent of 'known hosts' in openssh
 	cas := i.Secrets.GetCAs()
 	for i := range cas {
 		err = tc.AddTrustedCA(cas[i].V1())

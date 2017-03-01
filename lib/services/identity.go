@@ -91,11 +91,11 @@ type Identity interface {
 	// be used during tests.
 	DeleteUsedTOTPToken(user string) error
 
-	// UpsertWebSession updates or inserts a web session for a user and session id
-	UpsertWebSession(user, sid string, session WebSession, ttl time.Duration) error
+	// UpsertWebSession updates or inserts a web session for a user and session
+	UpsertWebSession(user, sid string, session WebSession) error
 
 	// GetWebSession returns a web session state for a given user and session id
-	GetWebSession(user, sid string) (*WebSession, error)
+	GetWebSession(user, sid string) (WebSession, error)
 
 	// DeleteWebSession deletes web session from the storage
 	DeleteWebSession(user, sid string) error
@@ -170,20 +170,6 @@ func VerifyPassword(password []byte) error {
 			"password is too long, max length is %v", defaults.MaxPasswordLength)
 	}
 	return nil
-}
-
-// WebSession stores key and value used to authenticate with SSH
-// notes on behalf of user
-type WebSession struct {
-	// Pub is a public certificate signed by auth server
-	Pub []byte `json:"pub"`
-	// Priv is a private OpenSSH key used to auth with SSH nodes
-	Priv []byte `json:"priv"`
-	// BearerToken is a special bearer token used for additional
-	// bearer authentication
-	BearerToken string `json:"bearer_token"`
-	// Expires - absolute time when token expires
-	Expires time.Time `json:"expires"`
 }
 
 // SignupToken stores metadata about user signup token
@@ -296,6 +282,7 @@ func (i *OIDCAuthRequest) Check() error {
 }
 
 // U2F is a configuration of the U2F two factor authentication
+// Deprecated: Use services.UniversalSecondFactor instead.
 type U2F struct {
 	Enabled bool
 	// AppID identifies the website to the U2F keys. It should not be changed once a U2F

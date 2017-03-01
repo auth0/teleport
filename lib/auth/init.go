@@ -46,6 +46,9 @@ type InitConfig struct {
 	// HostUUID is a UUID of this host
 	HostUUID string
 
+	// NodeName is the DNS name of the node
+	NodeName string
+
 	// DomainName stores the FQDN of the signing CA (its certificate will have this
 	// name embedded). It is usually set to the GUID of the host the Auth service runs on
 	DomainName string
@@ -84,6 +87,12 @@ type InitConfig struct {
 	// Access is service controlling access to resources
 	Access services.Access
 
+	// ClusterAuthPreferenceService is a service to get and set authentication preferences.
+	ClusterAuthPreferenceService services.ClusterAuthPreference
+
+	// UniversalSecondFactorService is a service to get and set universal second factor settings.
+	UniversalSecondFactorService services.UniversalSecondFactorSettings
+
 	// Roles is a set of roles to create
 	Roles []services.Role
 
@@ -91,8 +100,12 @@ type InitConfig struct {
 	// environments where paranoid security is not needed
 	StaticTokens []services.ProvisionToken
 
-	// U2F is the configuration of the U2F 2 factor authentication
-	U2F services.U2F
+	// AuthPreference defines the authentication type (local, oidc) and second
+	// factor (off, otp, u2f) passed in from a configuration file.
+	AuthPreference services.AuthPreference
+
+	// U2F defines U2F application ID and any facets passed in from a configuration file.
+	U2F services.UniversalSecondFactor
 }
 
 // Init instantiates and configures an instance of AuthServer
@@ -123,10 +136,27 @@ func Init(cfg InitConfig, seedConfig bool) (*AuthServer, *Identity, error) {
 	// and this is NOT the first time teleport starts on this machine
 	skipConfig := seedConfig && !firstStart
 
+	// upon first start, set the cluster auth prerference from the configuration file
+	// and create a resource on the backend, after that always read from the backend
+	if firstStart {
+		log.Infof("Initializing Cluster Authentication Preference: %v", cfg.AuthPreference)
+		err = asrv.SetClusterAuthPreference(cfg.AuthPreference)
+		if err != nil {
+			return nil, nil, trace.Wrap(err)
+		}
+
+		if cfg.U2F != nil {
+			log.Infof("Initializing Universal Second Factor Settings: %v", cfg.U2F)
+			err = asrv.SetUniversalSecondFactor(cfg.U2F)
+			if err != nil {
+				return nil, nil, trace.Wrap(err)
+			}
+		}
+	}
+
 	// add trusted authorities from the configuration into the trust backend:
 	keepMap := make(map[string]int, 0)
 	if !skipConfig {
-
 		log.Infof("Initializing roles")
 		for _, role := range cfg.Roles {
 			if err := asrv.UpsertRole(role); err != nil {
@@ -135,7 +165,12 @@ func Init(cfg InitConfig, seedConfig bool) (*AuthServer, *Identity, error) {
 		}
 
 		log.Infof("Initializing cert authorities")
-		for _, ca := range cfg.Authorities {
+		for i := range cfg.Authorities {
+			ca := cfg.Authorities[i]
+			ca, err = services.GetCertAuthorityMarshaler().GenerateCertAuthority(ca)
+			if err != nil {
+				return nil, nil, trace.Wrap(err)
+			}
 			if err := asrv.Trust.UpsertCertAuthority(ca, backend.Forever); err != nil {
 				return nil, nil, trace.Wrap(err)
 			}
@@ -253,7 +288,10 @@ func Init(cfg InitConfig, seedConfig bool) (*AuthServer, *Identity, error) {
 			}
 		}
 	}
-	// add OIDC connectors to the back-end:
+
+	// add OIDC connectors to the back-end. we always add connectors to the backend
+	// because settings can come from legacy configuration so we keep doing this
+	// until we remove support for legacy formats.
 	keepMap = make(map[string]int, 0)
 	if !skipConfig {
 		log.Infof("Initializing OIDC connectors")
@@ -277,6 +315,15 @@ func Init(cfg InitConfig, seedConfig bool) (*AuthServer, *Identity, error) {
 				}
 				log.Infof("removed OIDC connector '%s'", connector.GetName())
 			}
+		}
+	}
+
+	// migrate u2f settings to the backend. we do this because settings can come from legacy
+	// configuration so always push to the backend until we remove support for the legacy format.
+	if cfg.U2F != nil {
+		err = asrv.SetUniversalSecondFactor(cfg.U2F)
+		if err != nil {
+			return nil, nil, trace.Wrap(err)
 		}
 	}
 
@@ -317,7 +364,7 @@ func Init(cfg InitConfig, seedConfig bool) (*AuthServer, *Identity, error) {
 	}
 
 	identity, err := initKeys(asrv, cfg.DataDir,
-		IdentityID{HostUUID: cfg.HostUUID, Role: teleport.RoleAdmin})
+		IdentityID{HostUUID: cfg.HostUUID, NodeName: cfg.NodeName, Role: teleport.RoleAdmin})
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
@@ -367,7 +414,9 @@ func isFirstStart(authServer *AuthServer, cfg InitConfig) (bool, error) {
 	return false, nil
 }
 
-// initKeys initializes this node's host certificate signed by host authority
+// initKeys initializes a nodes host certificate. If the certificate does not exist, a request
+// is made to the certificate authority to generate a host certificate and it's written to disk.
+// If a certificate exists on disk, it is read in and returned.
 func initKeys(a *AuthServer, dataDir string, id IdentityID) (*Identity, error) {
 	kp, cp := keysPath(dataDir, id)
 
@@ -382,15 +431,13 @@ func initKeys(a *AuthServer, dataDir string, id IdentityID) (*Identity, error) {
 	}
 
 	if !keyExists || !certExists {
-		privateKey, publicKey, err := a.GenerateKeyPair("")
+		packedKeys, err := a.GenerateServerKeys(id.HostUUID, id.NodeName, teleport.Roles{id.Role})
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-		cert, err := a.GenerateHostCert(publicKey, id.HostUUID, a.DomainName, teleport.Roles{id.Role}, 0)
+
+		err = writeKeys(dataDir, id, packedKeys.Key, packedKeys.Cert)
 		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		if err := writeKeys(dataDir, id, privateKey, cert); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
@@ -426,10 +473,11 @@ type Identity struct {
 	AuthorityDomain string
 }
 
-// IdentityID is a combination of role and host UUID
+// IdentityID is a combination of role, host UUID, and node name.
 type IdentityID struct {
 	Role     teleport.Role
 	HostUUID string
+	NodeName string
 }
 
 // Equals returns true if two identities are equal
@@ -472,10 +520,18 @@ func ReadIdentityFromKeyPair(keyBytes, certBytes []byte) (*Identity, error) {
 	if err != nil {
 		return nil, trace.BadParameter("unsupported private key: %v", err)
 	}
-	if len(cert.ValidPrincipals) != 1 {
-		return nil, trace.BadParameter("valid principals: need exactly 1 valid principal: host uuid")
+
+	// check principals on certificate
+	if len(cert.ValidPrincipals) < 1 {
+		return nil, trace.BadParameter("valid principals: at least one valid principal is required")
+	}
+	for _, validPrincipal := range cert.ValidPrincipals {
+		if validPrincipal == "" {
+			return nil, trace.BadParameter("valid principal can not be empty: %q", cert.ValidPrincipals)
+		}
 	}
 
+	// check permissions on certificate
 	if len(cert.Permissions.Extensions) == 0 {
 		return nil, trace.BadParameter("extensions: misssing needed extensions for host roles")
 	}
@@ -496,10 +552,6 @@ func ReadIdentityFromKeyPair(keyBytes, certBytes []byte) (*Identity, error) {
 	authorityDomain := cert.Permissions.Extensions[utils.CertExtensionAuthority]
 	if authorityDomain == "" {
 		return nil, trace.BadParameter("misssing cert extension %v", utils.CertExtensionAuthority)
-	}
-
-	if cert.ValidPrincipals[0] == "" {
-		return nil, trace.BadParameter("valid principal can not be empty")
 	}
 
 	return &Identity{

@@ -17,6 +17,14 @@ build: bbox
 		make -C $(SRCDIR) ADDFLAGS='$(ADDFLAGS)' release
 
 #
+# Build 'teleport' release inside a docker container
+#
+.PHONY:build-binaries
+build-binaries: bbox
+	docker run $(DOCKERFLAGS) $(NOROOT) $(BBOX) \
+		make -C $(SRCDIR) ADDFLAGS='$(ADDFLAGS)' all
+
+#
 # Builds a Docker container which is used for building official Teleport 
 # binaries and docs
 #
@@ -32,6 +40,7 @@ test: integration
 	docker run $(DOCKERFLAGS) $(NOROOT) -t $(BBOX) \
 		/bin/bash -c \
 		"examples/etcd/start-etcd.sh & sleep 1; \
+		ssh-agent > external.agent && source external.agent; \
 		cd $(SRCDIR) && make TELEPORT_DEBUG=0 FLAGS='-cover -race' clean test"
 
 .PHONY:integration

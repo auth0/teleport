@@ -321,17 +321,19 @@ func (process *TeleportProcess) initAuthService(authority auth.Authority) error 
 		AuthServiceName: cfg.Hostname,
 		DataDir:         cfg.DataDir,
 		HostUUID:        cfg.HostUUID,
+		NodeName:        cfg.Hostname,
 		Authorities:     cfg.Auth.Authorities,
 		ReverseTunnels:  cfg.ReverseTunnels,
-		OIDCConnectors:  cfg.OIDCConnectors,
 		Trust:           cfg.Trust,
 		Presence:        cfg.Presence,
 		Provisioner:     cfg.Provisioner,
 		Identity:        cfg.Identity,
 		Access:          cfg.Access,
 		StaticTokens:    cfg.Auth.StaticTokens,
-		U2F:             cfg.Auth.U2F,
 		Roles:           cfg.Auth.Roles,
+		AuthPreference:  cfg.Auth.Preference,
+		OIDCConnectors:  cfg.OIDCConnectors,
+		U2F:             cfg.Auth.U2F,
 	}, cfg.SeedConfig)
 	if err != nil {
 		return trace.Wrap(err)
@@ -345,14 +347,14 @@ func (process *TeleportProcess) initAuthService(authority auth.Authority) error 
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	newChecker, err := auth.NewAccessChecker(authServer.Access, authServer.Identity)
+	authorizer, err := auth.NewAuthorizer(authServer.Access, authServer.Identity, authServer.Trust)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	apiConf := &auth.APIConfig{
 		AuthServer:     authServer,
 		SessionService: sessionService,
-		NewChecker:     newChecker,
+		Authorizer:     authorizer,
 		AuditLog:       auditLog,
 	}
 
@@ -552,7 +554,7 @@ func (process *TeleportProcess) initSSH() error {
 // certificate authority
 func (process *TeleportProcess) RegisterWithAuthServer(token string, role teleport.Role, eventName string) {
 	cfg := process.Config
-	identityID := auth.IdentityID{Role: role, HostUUID: cfg.HostUUID}
+	identityID := auth.IdentityID{Role: role, HostUUID: cfg.HostUUID, NodeName: cfg.Hostname}
 
 	// this means the server has not been initialized yet, we are starting
 	// the registering client that attempts to connect to the auth server
@@ -721,11 +723,13 @@ func (process *TeleportProcess) initProxyEndpoint(conn *Connector) error {
 			utils.Consolef(cfg.Console, "[PROXY] Web proxy service is starting on %v", cfg.Proxy.WebAddr.Addr)
 			webHandler, err := web.NewHandler(
 				web.Config{
-					Proxy:       tsrv,
-					AuthServers: cfg.AuthServers[0],
-					DomainName:  cfg.Hostname,
-					ProxyClient: conn.Client,
-					DisableUI:   cfg.Proxy.DisableWebUI,
+					Proxy:        tsrv,
+					AuthServers:  cfg.AuthServers[0],
+					DomainName:   cfg.Hostname,
+					ProxyClient:  conn.Client,
+					DisableUI:    cfg.Proxy.DisableWebUI,
+					ProxySSHAddr: cfg.Proxy.SSHAddr,
+					ProxyWebAddr: cfg.Proxy.WebAddr,
 				})
 			if err != nil {
 				utils.Consolef(cfg.Console, "[PROXY] starting the web server: %v", err)

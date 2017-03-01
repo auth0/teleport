@@ -7,6 +7,18 @@ import (
 // ForeverTTL means that object TTL will not expire unless deleted
 const ForeverTTL time.Duration = 0
 
+// SSHAuthSock is the environment variable pointing to the
+// Unix socket the SSH agent is running on.
+const SSHAuthSock = "SSH_AUTH_SOCK"
+
+const (
+	// TOTPValidityPeriod is the number of seconds a TOTP token is valid.
+	TOTPValidityPeriod uint = 30
+
+	// TOTPSkew adds that many periods before and after to the validity window.
+	TOTPSkew uint = 1
+)
+
 const (
 	// Component indicates a component of teleport, used for logging
 	Component = "component"
@@ -56,18 +68,28 @@ const (
 	// to all backends during initialization
 	DataDirParameterName = "data_dir"
 
-	// OTP means One-time Password Algorithm.
+	// SSH request type to keep the connection alive. A client and a server keep
+	// pining each other with it:
+	KeepAliveReqType = "keepalive@openssh.com"
+
+	// OTP means One-time Password Algorithm for Two-Factor Authentication.
 	OTP = "otp"
 
-	// TOTP means Time-based One-time Password Algorithm.
+	// TOTP means Time-based One-time Password Algorithm. for Two-Factor Authentication.
 	TOTP = "totp"
 
-	// HOTP means HMAC-based One-time Password Algorithm.
-	HOTP = "htop"
+	// HOTP means HMAC-based One-time Password Algorithm.for Two-Factor Authentication.
+	HOTP = "hotp"
 
-	// U2F means Universal 2nd Factor.
+	// U2F means Universal 2nd Factor.for Two-Factor Authentication.
 	U2F = "u2f"
 
-	// OIDC means OpenID Connect.
+	// OFF means no second factor.for Two-Factor Authentication.
+	OFF = "off"
+
+	// Local means authentication will happen locally within the Teleport cluster.
+	Local = "local"
+
+	// OIDC means authentication will happen remotly using an OIDC connector.
 	OIDC = "oidc"
 )

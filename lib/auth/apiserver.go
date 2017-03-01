@@ -42,7 +42,7 @@ type APIConfig struct {
 	AuthServer     *AuthServer
 	SessionService session.Service
 	AuditLog       events.IAuditLog
-	NewChecker     NewChecker
+	Authorizer     Authorizer
 }
 
 // APIServer implements http API server for AuthServer interface
@@ -117,14 +117,6 @@ func NewAPIServer(config *APIConfig) http.Handler {
 	srv.GET("/:version/namespaces/:namespace/sessions/:id/stream", srv.withAuth(srv.getSessionChunk))
 	srv.GET("/:version/namespaces/:namespace/sessions/:id/events", srv.withAuth(srv.getSessionEvents))
 
-	// OIDC
-	srv.POST("/:version/oidc/connectors", srv.withAuth(srv.upsertOIDCConnector))
-	srv.GET("/:version/oidc/connectors", srv.withAuth(srv.getOIDCConnectors))
-	srv.GET("/:version/oidc/connectors/:id", srv.withAuth(srv.getOIDCConnector))
-	srv.DELETE("/:version/oidc/connectors/:id", srv.withAuth(srv.deleteOIDCConnector))
-	srv.POST("/:version/oidc/requests/create", srv.withAuth(srv.createOIDCAuthRequest))
-	srv.POST("/:version/oidc/requests/validate", srv.withAuth(srv.validateOIDCAuthCallback))
-
 	// Namespaces
 	srv.POST("/:version/namespaces", srv.withAuth(srv.upsertNamespace))
 	srv.GET("/:version/namespaces", srv.withAuth(srv.getNamespaces))
@@ -136,6 +128,20 @@ func NewAPIServer(config *APIConfig) http.Handler {
 	srv.GET("/:version/roles", srv.withAuth(srv.getRoles))
 	srv.GET("/:version/roles/:role", srv.withAuth(srv.getRole))
 	srv.DELETE("/:version/roles/:role", srv.withAuth(srv.deleteRole))
+
+	// cluster authentication preferences
+	srv.GET("/:version/authentication/preference", srv.withAuth(srv.getClusterAuthPreference))
+	srv.POST("/:version/authentication/preference", srv.withAuth(srv.setClusterAuthPreference))
+	srv.GET("/:version/authentication/preference/u2f", srv.withAuth(srv.getUniversalSecondFactor))
+	srv.POST("/:version/authentication/preference/u2f", srv.withAuth(srv.setUniversalSecondFactor))
+
+	// OIDC
+	srv.POST("/:version/oidc/connectors", srv.withAuth(srv.upsertOIDCConnector))
+	srv.GET("/:version/oidc/connectors", srv.withAuth(srv.getOIDCConnectors))
+	srv.GET("/:version/oidc/connectors/:id", srv.withAuth(srv.getOIDCConnector))
+	srv.DELETE("/:version/oidc/connectors/:id", srv.withAuth(srv.deleteOIDCConnector))
+	srv.POST("/:version/oidc/requests/create", srv.withAuth(srv.createOIDCAuthRequest))
+	srv.POST("/:version/oidc/requests/validate", srv.withAuth(srv.validateOIDCAuthCallback))
 
 	// U2F
 	srv.GET("/:version/u2f/signuptokens/:token", srv.withAuth(srv.getSignupU2FRegisterRequest))
@@ -163,23 +169,19 @@ func NewAPIServer(config *APIConfig) http.Handler {
 type HandlerWithAuthFunc func(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error)
 
 func (s *APIServer) withAuth(handler HandlerWithAuthFunc) httprouter.Handle {
+	const accessDeniedMsg = "auth API: access denied "
 	return httplib.MakeHandler(func(w http.ResponseWriter, r *http.Request, p httprouter.Params) (interface{}, error) {
-		// SSH-to-HTTP gateway (tun server) sets HTTP basic auth to SSH cert principal
-		// This allows us to make sure that users can only request new certificates
-		// only for themselves, except admin users
-		caller, _, ok := r.BasicAuth()
-		if !ok {
-			return nil, trace.AccessDenied("missing username or password")
-		}
-		checker, err := s.NewChecker(caller)
+		// SSH-to-HTTP gateway (tun server) expects the auth
+		// context to be set by SSH server
+		authContext, err := s.Authorizer.Authorize(r.Context())
 		if err != nil {
-			log.Debugf("failed to create checker: %v for %v", err, caller)
-			return nil, trace.AccessDenied("missing username or password")
+			log.Warn(accessDeniedMsg + err.Error())
+			return nil, trace.AccessDenied(accessDeniedMsg + "[00]")
 		}
 		auth := &AuthWithRoles{
 			authServer: s.AuthServer,
-			user:       caller,
-			checker:    checker,
+			user:       authContext.Username,
+			checker:    authContext.Checker,
 			sessions:   s.SessionService,
 			alog:       s.AuditLog,
 		}
@@ -375,13 +377,37 @@ func (s *APIServer) deleteWebSession(auth ClientI, w http.ResponseWriter, r *htt
 	return message(fmt.Sprintf("session '%v' for user '%v' deleted", sid, user)), nil
 }
 
+// sessionV1 is a V1 style web session, used in legacy v1 API
+type sessionV1 struct {
+	// ID is a session ID
+	ID string `json:"id"`
+	// Username is a user this session belongs to
+	Username string `json:"username"`
+	// ExpiresAt is an optional expiry time, if set
+	// that means this web session and all derived web sessions
+	// can not continue after this time, used in OIDC use case
+	// when expiry is set by external identity provider, so user
+	// has to relogin (or later on we'd need to refresh the token)
+	ExpiresAt time.Time `json:"expires_at"`
+	// WS is a private keypair used for signing requests
+	WS services.WebSessionV1 `json:"web"`
+}
+
 func (s *APIServer) getWebSession(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
 	user, sid := p.ByName("user"), p.ByName("sid")
 	sess, err := auth.GetWebSessionInfo(user, sid)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return sess, nil
+	if version == services.V1 {
+		return &sessionV1{
+			ID:        sess.GetName(),
+			Username:  sess.GetUser(),
+			ExpiresAt: sess.GetExpiryTime(),
+			WS:        *(sess.V1()),
+		}, nil
+	}
+	return rawMessage(services.GetWebSessionMarshaler().MarshalWebSession(sess, services.WithVersion(version)))
 }
 
 type signInReq struct {
@@ -399,8 +425,7 @@ func (s *APIServer) signIn(auth ClientI, w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
-	return sess, nil
+	return rawMessage(services.GetWebSessionMarshaler().MarshalWebSession(sess, services.WithVersion(version)))
 }
 
 func (s *APIServer) preAuthenticatedSignIn(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
@@ -409,7 +434,7 @@ func (s *APIServer) preAuthenticatedSignIn(auth ClientI, w http.ResponseWriter, 
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return sess, nil
+	return rawMessage(services.GetWebSessionMarshaler().MarshalWebSession(sess, services.WithVersion(version)))
 }
 
 func (s *APIServer) u2fSignRequest(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
@@ -447,7 +472,7 @@ func (s *APIServer) createWebSession(auth ClientI, w http.ResponseWriter, r *htt
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return sess, nil
+	return rawMessage(services.GetWebSessionMarshaler().MarshalWebSession(sess, services.WithVersion(version)))
 }
 
 type upsertPasswordReq struct {
@@ -571,11 +596,12 @@ func (s *APIServer) generateKeyPair(auth ClientI, w http.ResponseWriter, r *http
 }
 
 type generateHostCertReq struct {
-	Key        []byte         `json:"key"`
-	Hostname   string         `json:"hostname"`
-	AuthDomain string         `json:"auth_domain"`
-	Roles      teleport.Roles `json:"roles"`
-	TTL        time.Duration  `json:"ttl"`
+	Key         []byte         `json:"key"`
+	HostID      string         `json:"hostname"`
+	NodeName    string         `json:"node_name"`
+	ClusterName string         `json:"auth_domain"`
+	Roles       teleport.Roles `json:"roles"`
+	TTL         time.Duration  `json:"ttl"`
 }
 
 func (s *APIServer) generateHostCert(auth ClientI, w http.ResponseWriter, r *http.Request, _ httprouter.Params, version string) (interface{}, error) {
@@ -583,10 +609,12 @@ func (s *APIServer) generateHostCert(auth ClientI, w http.ResponseWriter, r *htt
 	if err := httplib.ReadJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	cert, err := auth.GenerateHostCert(req.Key, req.Hostname, req.AuthDomain, req.Roles, req.TTL)
+
+	cert, err := auth.GenerateHostCert(req.Key, req.HostID, req.NodeName, req.ClusterName, req.Roles, req.TTL)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	return string(cert), nil
 }
 
@@ -626,9 +654,10 @@ func (s *APIServer) generateToken(auth ClientI, w http.ResponseWriter, r *http.R
 }
 
 type registerUsingTokenReq struct {
-	HostID string        `json:"hostID"`
-	Role   teleport.Role `json:"role"`
-	Token  string        `json:"token"`
+	HostID   string        `json:"hostID"`
+	NodeName string        `json:"node_name"`
+	Role     teleport.Role `json:"role"`
+	Token    string        `json:"token"`
 }
 
 func (s *APIServer) registerUsingToken(auth ClientI, w http.ResponseWriter, r *http.Request, _ httprouter.Params, version string) (interface{}, error) {
@@ -636,10 +665,12 @@ func (s *APIServer) registerUsingToken(auth ClientI, w http.ResponseWriter, r *h
 	if err := httplib.ReadJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	keys, err := auth.RegisterUsingToken(req.Token, req.HostID, req.Role)
+
+	keys, err := auth.RegisterUsingToken(req.Token, req.HostID, req.NodeName, req.Role)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	return keys, nil
 }
 
@@ -725,12 +756,13 @@ func (s *APIServer) getDomainName(auth ClientI, w http.ResponseWriter, r *http.R
 
 // getU2FAppID returns the U2F AppID in the auth configuration
 func (s *APIServer) getU2FAppID(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	appID, err := auth.GetU2FAppID()
+	universalSecondFactor, err := auth.GetUniversalSecondFactor()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	w.Header().Set("Content-Type", "application/fido.trusted-apps+json")
-	return appID, nil
+	return universalSecondFactor.GetAppID(), nil
 }
 
 func (s *APIServer) deleteCertAuthority(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
@@ -866,7 +898,7 @@ func (s *APIServer) createUserWithToken(auth ClientI, w http.ResponseWriter, r *
 		return nil, trace.Wrap(err)
 	}
 
-	return sess, nil
+	return rawMessage(services.GetWebSessionMarshaler().MarshalWebSession(sess, services.WithVersion(version)))
 }
 
 type createUserWithU2FTokenReq struct {
@@ -886,7 +918,7 @@ func (s *APIServer) createUserWithU2FToken(auth ClientI, w http.ResponseWriter, 
 		log.Error(err)
 		return nil, trace.Wrap(err)
 	}
-	return sess, nil
+	return rawMessage(services.GetWebSessionMarshaler().MarshalWebSession(sess, services.WithVersion(version)))
 }
 
 type upsertOIDCConnectorRawReq struct {
@@ -978,7 +1010,7 @@ type oidcAuthRawResponse struct {
 	// Identity contains validated OIDC identity
 	Identity services.OIDCIdentity `json:"identity"`
 	// Web session will be generated by auth server if requested in OIDCAuthRequest
-	Session *Session `json:"session,omitempty"`
+	Session json.RawMessage `json:"session,omitempty"`
 	// Cert will be generated by certificate authority
 	Cert []byte `json:"cert,omitempty"`
 	// Req is original oidc auth request
@@ -1000,9 +1032,15 @@ func (s *APIServer) validateOIDCAuthCallback(auth ClientI, w http.ResponseWriter
 	raw := oidcAuthRawResponse{
 		Username: response.Username,
 		Identity: response.Identity,
-		Session:  response.Session,
 		Cert:     response.Cert,
 		Req:      response.Req,
+	}
+	if response.Session != nil {
+		rawSession, err := services.GetWebSessionMarshaler().MarshalWebSession(response.Session, services.WithVersion(version))
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		raw.Session = rawSession
 	}
 	raw.HostSigners = make([]json.RawMessage, len(response.HostSigners))
 	for i, ca := range response.HostSigners {
@@ -1012,7 +1050,7 @@ func (s *APIServer) validateOIDCAuthCallback(auth ClientI, w http.ResponseWriter
 		}
 		raw.HostSigners[i] = data
 	}
-	return raw, nil
+	return &raw, nil
 }
 
 // HTTP GET /:version/events?query
@@ -1130,7 +1168,6 @@ func (s *APIServer) getSessionEvents(auth ClientI, w http.ResponseWriter, r *htt
 	if err != nil {
 		afterN = 0
 	}
-	log.Debugf("[AUTH] api.getSessionEvents(%v, after=%d)", *sid, afterN)
 	return auth.GetSessionEvents(namespace, *sid, afterN)
 }
 
@@ -1225,6 +1262,74 @@ func (s *APIServer) deleteRole(auth ClientI, w http.ResponseWriter, r *http.Requ
 		return nil, trace.Wrap(err)
 	}
 	return message(fmt.Sprintf("role '%v' deleted", role)), nil
+}
+
+func (s *APIServer) getClusterAuthPreference(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	cap, err := auth.GetClusterAuthPreference()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return rawMessage(services.GetAuthPreferenceMarshaler().Marshal(cap, services.WithVersion(version)))
+}
+
+type setClusterAuthPreferenceReq struct {
+	ClusterAuthPreference json.RawMessage `json:"cluster_auth_prerference"`
+}
+
+func (s *APIServer) setClusterAuthPreference(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	var req *setClusterAuthPreferenceReq
+
+	err := httplib.ReadJSON(r, &req)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	cap, err := services.GetAuthPreferenceMarshaler().Unmarshal(req.ClusterAuthPreference)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	err = auth.SetClusterAuthPreference(cap)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return message(fmt.Sprintf("cluster authenticaton preference set: %+v", cap)), nil
+}
+
+func (s *APIServer) getUniversalSecondFactor(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	universalSecondFactor, err := auth.GetUniversalSecondFactor()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return rawMessage(services.GetUniversalSecondFactorMarshaler().Marshal(universalSecondFactor, services.WithVersion(version)))
+}
+
+type setUniversalSecondFactorReq struct {
+	UniversalSecondFactor json.RawMessage `json:"universal_second_factor"`
+}
+
+func (s *APIServer) setUniversalSecondFactor(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	var req *setUniversalSecondFactorReq
+
+	err := httplib.ReadJSON(r, &req)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	universalSecondFactor, err := services.GetUniversalSecondFactorMarshaler().Unmarshal(req.UniversalSecondFactor)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	err = auth.SetUniversalSecondFactor(universalSecondFactor)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return message(fmt.Sprintf("universal second factor set: %+v", universalSecondFactor)), nil
 }
 
 func message(msg string) map[string]interface{} {

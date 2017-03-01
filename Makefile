@@ -1,8 +1,8 @@
-# Update this variable, then run 'make setver'
+# Update this variable, then run 'make'
 # Naming convention:
 #	for stable releases we use "1.0.0" format
 #   for pre-releases, we use   "1.0.0-beta.2" format
-VERSION=1.5.0-alpha
+VERSION=2.0.0-alpha.7
 
 # These are standard autotools variables, don't change them please
 BUILDDIR ?= build
@@ -17,18 +17,19 @@ BUILDFLAGS := $(ADDFLAGS) -ldflags '-w -s'
 RELEASE=teleport-$(GITTAG)-`go env GOOS`-`go env GOARCH`-bin
 BINARIES=$(BUILDDIR)/tsh $(BUILDDIR)/teleport $(BUILDDIR)/tctl
 
-LIBS != find lib -type f -name '*.go'
+VERSRC = version.go gitref.go
+LIBS = $(shell find lib -type f -name '*.go') *.go
 
 #
 # Default target: builds all 3 executables and plaaces them in a current directory
 #
 .PHONY: all
-all: setver $(BINARIES) 
+all: $(VERSRC) $(BINARIES) 
 
 $(BUILDDIR)/tctl: $(LIBS) $(TOOLS) tool/tctl/*.go
 	go build -o $(BUILDDIR)/tctl -i $(BUILDFLAGS) ./tool/tctl
 
-$(BUILDDIR)/teleport: $(LIBS) tool/teleport/*.go *.go
+$(BUILDDIR)/teleport: $(LIBS) tool/teleport/*.go
 	go build -o $(BUILDDIR)/teleport -i $(BUILDFLAGS) ./tool/teleport
 
 $(BUILDDIR)/tsh: $(LIBS) tool/tsh/*.go
@@ -52,6 +53,7 @@ clean:
 	rm -rf $(BUILDDIR)
 	rm -rf teleport
 	rm -rf *.gz
+
 
 #
 # Builds docs using containerized mkdocs
@@ -86,12 +88,8 @@ test:
 integration: 
 	go test -v ./integration/...
 
-
-# make setver - bump the version of teleport
-#	Reads the version from version.mk, updates version.go and
-#	assigns a git tag to the currently checked out tree
-.PHONY: setver
-setver:
+# This rule triggers re-generation of version.go and gitref.go if Makefile changes
+$(VERSRC): Makefile
 	VERSION=$(VERSION) $(MAKE) -f version.mk setver
 
 # make tag - prints a tag to use with git for the current version

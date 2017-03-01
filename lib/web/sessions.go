@@ -23,9 +23,11 @@ import (
 	"time"
 
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/jonboulle/clockwork"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/gravitational/trace"
@@ -41,7 +43,7 @@ import (
 type SessionContext struct {
 	sync.Mutex
 	*log.Entry
-	sess    *auth.Session
+	sess    services.WebSession
 	user    string
 	clt     *auth.TunClient
 	parent  *sessionCache
@@ -62,19 +64,24 @@ func (c *SessionContext) getTerminal(sessionID session.ID) (*terminalHandler, er
 	return nil, trace.NotFound("no connected streams")
 }
 
+// UpdateSessionTerminal is called when a browser window is resized and
+// we need to update PTY on the server side
 func (c *SessionContext) UpdateSessionTerminal(
-	namespace string, sessionID session.ID, params session.TerminalParams) error {
+	siteAPI auth.ClientI, namespace string, sessionID session.ID, params session.TerminalParams) error {
 
-	err := c.clt.UpdateSession(session.UpdateRequest{
+	// update the session size on the auth server's side
+	err := siteAPI.UpdateSession(session.UpdateRequest{
 		ID:             sessionID,
 		TerminalParams: &params,
 		Namespace:      namespace,
 	})
 	if err != nil {
-		return trace.Wrap(err)
+		log.Error(err)
 	}
+	// update the server-side PTY to match the browser window size
 	term, err := c.getTerminal(sessionID)
 	if err != nil {
+		log.Error(err)
 		return trace.Wrap(err)
 	}
 	return trace.Wrap(term.resizePTYWindow(params))
@@ -84,6 +91,17 @@ func (c *SessionContext) AddClosers(closers ...io.Closer) {
 	c.Lock()
 	defer c.Unlock()
 	c.closers = append(c.closers, closers...)
+}
+
+func (c *SessionContext) RemoveCloser(closer io.Closer) {
+	c.Lock()
+	defer c.Unlock()
+	for i := range c.closers {
+		if c.closers[i] == closer {
+			c.closers = append(c.closers[:i], c.closers[i+1:]...)
+			return
+		}
+	}
 }
 
 func (c *SessionContext) TransferClosers() []io.Closer {
@@ -109,14 +127,14 @@ func (c *SessionContext) GetUser() string {
 }
 
 // GetWebSession returns a web session
-func (c *SessionContext) GetWebSession() *auth.Session {
+func (c *SessionContext) GetWebSession() services.WebSession {
 	return c.sess
 }
 
 // ExtendWebSession creates a new web session for this user
 // based on the previous session
-func (c *SessionContext) ExtendWebSession() (*auth.Session, error) {
-	sess, err := c.clt.ExtendWebSession(c.user, c.sess.ID)
+func (c *SessionContext) ExtendWebSession() (services.WebSession, error) {
+	sess, err := c.clt.ExtendWebSession(c.user, c.sess.GetName())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -126,11 +144,7 @@ func (c *SessionContext) ExtendWebSession() (*auth.Session, error) {
 // GetAgent returns agent that can we used to answer challenges
 // for the web to ssh connection
 func (c *SessionContext) GetAgent() (auth.AgentCloser, error) {
-	a, err := c.clt.GetAgent()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return a, nil
+	return c.clt.GetAgent()
 }
 
 // Close cleans up connections associated with requests
@@ -216,7 +230,7 @@ func (s *sessionCache) clearExpiredSessions() {
 	}
 }
 
-func (s *sessionCache) Auth(user, pass string, otpToken string) (*auth.Session, error) {
+func (s *sessionCache) Auth(user, pass string, otpToken string) (services.WebSession, error) {
 	method, err := auth.NewWebPasswordAuth(user, []byte(pass), otpToken)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -261,7 +275,7 @@ func (s *sessionCache) GetU2FSignRequest(user, pass string) (*u2f.SignRequest, e
 	return u2fSignReq, nil
 }
 
-func (s *sessionCache) AuthWithU2FSignResponse(user string, response *u2f.SignResponse) (*auth.Session, error) {
+func (s *sessionCache) AuthWithU2FSignResponse(user string, response *u2f.SignResponse) (services.WebSession, error) {
 	method, err := auth.NewWebU2FSignResponseAuth(user, response)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -278,7 +292,7 @@ func (s *sessionCache) AuthWithU2FSignResponse(user string, response *u2f.SignRe
 	return session, nil
 }
 
-func (s *sessionCache) GetCertificate(c createSSHCertReq) (*SSHLoginResponse, error) {
+func (s *sessionCache) GetCertificate(c client.CreateSSHCertReq) (*client.SSHLoginResponse, error) {
 	method, err := auth.NewWebPasswordAuth(c.User, []byte(c.Password), c.OTPToken)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -293,7 +307,7 @@ func (s *sessionCache) GetCertificate(c createSSHCertReq) (*SSHLoginResponse, er
 	return createCertificate(c.User, c.PubKey, c.TTL, clt)
 }
 
-func createCertificate(user string, pubkey []byte, ttl time.Duration, clt *auth.TunClient) (*SSHLoginResponse, error) {
+func createCertificate(user string, pubkey []byte, ttl time.Duration, clt *auth.TunClient) (*client.SSHLoginResponse, error) {
 	cert, err := clt.GenerateUserCert(pubkey, user, ttl)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -307,13 +321,13 @@ func createCertificate(user string, pubkey []byte, ttl time.Duration, clt *auth.
 		return nil, trace.Wrap(err)
 	}
 
-	return &SSHLoginResponse{
+	return &client.SSHLoginResponse{
 		Cert:        cert,
 		HostSigners: signers,
 	}, nil
 }
 
-func (s *sessionCache) GetCertificateWithU2F(c createSSHCertWithU2FReq) (*SSHLoginResponse, error) {
+func (s *sessionCache) GetCertificateWithU2F(c client.CreateSSHCertWithU2FReq) (*client.SSHLoginResponse, error) {
 	method, err := auth.NewWebU2FSignResponseAuth(c.User, &c.U2FSignResponse)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -355,7 +369,7 @@ func (s *sessionCache) GetUserInviteU2FRegisterRequest(token string) (u2fRegiste
 	return clt.GetSignupU2FRegisterRequest(token)
 }
 
-func (s *sessionCache) CreateNewUser(token, password, otpToken string) (*auth.Session, error) {
+func (s *sessionCache) CreateNewUser(token, password, otpToken string) (services.WebSession, error) {
 	method, err := auth.NewSignupTokenAuth(token)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -371,7 +385,7 @@ func (s *sessionCache) CreateNewUser(token, password, otpToken string) (*auth.Se
 	return sess, trace.Wrap(err)
 }
 
-func (s *sessionCache) CreateNewU2FUser(token string, password string, u2fRegisterResponse u2f.RegisterResponse) (*auth.Session, error) {
+func (s *sessionCache) CreateNewU2FUser(token string, password string, u2fRegisterResponse u2f.RegisterResponse) (services.WebSession, error) {
 	method, err := auth.NewSignupTokenAuth(token)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -387,14 +401,14 @@ func (s *sessionCache) CreateNewU2FUser(token string, password string, u2fRegist
 
 func (s *sessionCache) InvalidateSession(ctx *SessionContext) error {
 	defer ctx.Close()
-	if err := s.resetContext(ctx.GetUser(), ctx.GetWebSession().ID); err != nil {
+	if err := s.resetContext(ctx.GetUser(), ctx.GetWebSession().GetName()); err != nil {
 		return trace.Wrap(err)
 	}
 	clt, err := ctx.GetClient()
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	err = clt.DeleteWebSession(ctx.GetUser(), ctx.GetWebSession().ID)
+	err = clt.DeleteWebSession(ctx.GetUser(), ctx.GetWebSession().GetName())
 	return trace.Wrap(err)
 }
 
@@ -460,10 +474,11 @@ func (s *sessionCache) ValidateSession(user, sid string) (*SessionContext, error
 	}
 	c.Entry = log.WithFields(log.Fields{
 		"user": user,
-		"sess": sess.ID[:4],
+		"sess": sess.GetShortName(),
 	})
 
-	out, err := s.insertContext(user, sid, c, auth.WebSessionTTL)
+	ttl := utils.ToTTL(clockwork.NewRealClock(), sess.GetBearerTokenExpiryTime())
+	out, err := s.insertContext(user, sid, c, ttl)
 	if err != nil {
 		// this means that someone has just inserted the context, so
 		// close our extra context and return

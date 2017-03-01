@@ -197,6 +197,13 @@ auth_service:
     # Turns 'auth' role on. Default is 'yes'
     enabled: yes
 
+    # defines the types and second factors the auth server supports
+    authentication:
+        # type can be local or oidc
+        type: local
+        # second_factor can be off, otp, or u2f
+        second_factor: otp
+
     # IP and the port to bind to. Other Teleport nodes will be connecting to
     # this port (AKA "Auth API" or "Cluster API") to validate client 
     # certificates 
@@ -357,7 +364,10 @@ Gravitational Teleport is a "clustered" SSH manager, meaning it only allows SSH
 access to nodes that had been previously granted cluster membership. 
 
 A cluster membership means that every node in a cluster has its own host
-certificate signed by the cluster's auth server. 
+certificate signed by the cluster's auth server. Note: if interoperability with
+OpenSSH is a concern, make sure the node name and DNS name match because OpenSSH
+clients validate the DNS name against the node name presented on the certificate
+when connecting to a Teleport node.
 
 A new Teleport node needs an "invite token" to join a cluster. An invitation token 
 also defines which role a new node can assume within a cluster: `auth`, `proxy` or 
@@ -389,7 +399,7 @@ flag to "xxxxxx". This node will join the cluster as a regular node but also
 as a proxy server:
 
 ```bash
-teleport start --roles=node,auth --token=xxxxx --auth-server=10.0.10.5
+teleport start --roles=node,proxy --token=xxxxx --auth-server=10.0.10.5
 ```
 
 ### Short-lived Tokens
@@ -638,26 +648,36 @@ to verify that host's certificates are signed by the trusted CA key:
 > cat cluster_node_keys >> ~/.ssh/known_hosts
 ```
 
-Configure OpenSSH client to use the Teleport proxy when connecting to nodes with matching
-names. Edit `/etc/ssh/ssh_config`:
-
-```
-# Tell OpenSSH client to use work.example.com as a jumphost (proxy) when logging
-# to any remote node whose name matches the pattern *.work.example.com
-# Beware of recursion here (when proxy name matches your pattern)
-Host *.work.example.com
-  ProxyCommand ssh -p 3023 %r@work.example.com -s proxy:%h:%p
-```
-
 Launch `tsh` in the SSH agent mode:
 
 ```bash
 > tsh --proxy=work.example.com agent
 ```
 
-`tsh agent` will print environment variables into the console. Configure your system
-to evaluate these variables: they tell `ssh` to use `tsh` to authenticate you against
-`work.example.com` cluster.
+`tsh agent` will print environment variables into the console. Copy and paste
+the output into the shell you will be using to connect to a Teleport node.
+The output exports the `SSH_AUTH_SOCK` and `SSH_AGENT_PID` environment variables
+that allow OpenSSH clients to find the SSH agent.
+
+Lastly, configure the OpenSSH client to use the Teleport proxy when connecting
+to nodes with matching names. Edit `~/.ssh/config` for your user or
+`/etc/ssh/ssh_config` for global changes:
+
+```
+# work.example.com is the jump host (proxy). credentials will be obtained from the
+# teleport agent.
+Host work.example.com
+    HostName 192.168.1.2
+    Port 3023
+
+# connect to nodes in the work.example.com cluster through the jump
+# host (proxy) using the same. credentials will be obtained from the
+# teleport agent.
+Host *.work.example.com
+    HostName %h
+    Port 3022
+    ProxyCommand ssh -p 3023 %r@work.example.com -s proxy:%h:%p
+```
 
 When everything is configured properly, you can use ssh to connect to any node 
 behind `work.example.com`:
@@ -665,6 +685,13 @@ behind `work.example.com`:
 ```bash
 > ssh root@database.work.example.com
 ```
+
+!!! tip "NOTE":
+    Teleport uses OpenSSH certificates instead of keys which means you can not connect
+    to a Teleport node by IP address you have to connect by DNS name. This is because
+    OpenSSH ensures the DNS name of the node you are connecting is listed listed under
+    the `Principals` section of the OpenSSH certificate to verify you are connecting
+    to the correct node.
 
 ### Integrating with OpenSSH Servers
 
@@ -727,14 +754,20 @@ OIDC integration with applications like Teleport.
 
 ```
 auth_service:
-  enabled: true
-  cluster_name: magadan
-  oidc_connectors:    
-    - id: google
-      redirect_url: https://localhost:3080/v1/webapi/oidc/callback
-      client_id: id-from-google.apps.googleusercontent.com
-      client_secret: secret-key-from-google
-      issuer_url: https://accounts.google.com
+    authentication:
+        type: oidc
+        oidc:
+            id: google
+            redirect_url: https://localhost:3080/v1/webapi/oidc/callback
+            client_id: id-from-google.apps.googleusercontent.com
+            client_secret: secret-key-from-google
+            issuer_url: https://accounts.google.com
+            display: "whaterver"
+            scope: ["ssh_permissions", "roles"]
+            claims_to_roles: 
+                - claim: role
+                  value: admin
+                  roles: ["dba", "backup", "root"]
 ```
 
 Now you should be able to create Teleport users whose identity is managed by Google.
@@ -797,17 +830,17 @@ service configuration in `teleport.yaml`:
 
 ```bash
 auth_service:
-  u2f:
-    # Must be set to 'yes' to enable and 'no' to disable:
-    enabled: yes
+    authentication:
+        type: local
+        second_factor: u2f 
+        u2f:
+            # Only matters when multiple proxy servers are used:
+            app_id: https://mycorp.com/appid.js
 
-    # Only matters when multiple proxy servers are used:
-    app_id: https://mycorp.com/appid.js
-
-    # U2F facets must be set to Teleport proxy servers:
-    facets:
-    - https://proxy1.mycorp.com:3080
-    - https://proxy2.mycorp.com:3080
+            # U2F facets must be set to Teleport proxy servers:
+            facets:
+            - https://proxy1.mycorp.com:3080
+            - https://proxy2.mycorp.com:3080
 ```
 
 If your Teleport is deployed with the same `teleport` process running as a proxy

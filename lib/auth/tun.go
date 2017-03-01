@@ -18,6 +18,7 @@ limitations under the License.
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -235,36 +236,38 @@ func (s *AuthTunnel) isHostAuthority(auth ssh.PublicKey) bool {
 	return false
 }
 
-// isUserAuthority is called during checking the client key, to see if the signing
-// key is the real user CA authority key.
-func (s *AuthTunnel) isUserAuthority(auth ssh.PublicKey) bool {
-	keys, err := s.getTrustedCAKeys(services.UserCA)
+// findUserAuthority finds matching user CA based on its public key
+func (s *AuthTunnel) findUserAuthority(auth ssh.PublicKey) (services.CertAuthority, error) {
+	cas, err := s.authServer.GetCertAuthorities(services.UserCA, false)
 	if err != nil {
-		log.Errorf("failed to retrieve trusted keys, err: %v", err)
-		return false
+		return nil, trace.Wrap(err)
 	}
-	for _, k := range keys {
-		if sshutils.KeysEqual(k, auth) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *AuthTunnel) getTrustedCAKeys(CertType services.CertAuthType) ([]ssh.PublicKey, error) {
-	cas, err := s.authServer.GetCertAuthorities(CertType, false)
-	if err != nil {
-		return nil, err
-	}
-	out := []ssh.PublicKey{}
 	for _, ca := range cas {
 		checkers, err := ca.Checkers()
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-		out = append(out, checkers...)
+		for _, checker := range checkers {
+			if sshutils.KeysEqual(checker, auth) {
+				return ca, nil
+			}
+		}
 	}
-	return out, nil
+	return nil, trace.NotFound("no matching certificate authority found")
+}
+
+// isUserAuthority is called during checking the client key, to see if the signing
+// key is the real user CA authority key.
+func (s *AuthTunnel) isUserAuthority(auth ssh.PublicKey) bool {
+	_, err := s.findUserAuthority(auth)
+	if err != nil {
+		if !trace.IsNotFound(err) {
+			// something bad happened, need to log
+			log.Error(err)
+		}
+		return false
+	}
+	return true
 }
 
 func (s *AuthTunnel) haveExt(sconn *ssh.ServerConn, ext ...string) bool {
@@ -294,13 +297,13 @@ func (s *AuthTunnel) handleWebAgentRequest(sconn *ssh.ServerConn, ch ssh.Channel
 		return
 	}
 
-	priv, err := ssh.ParseRawPrivateKey(ws.WS.Priv)
+	priv, err := ssh.ParseRawPrivateKey(ws.GetPriv())
 	if err != nil {
 		log.Errorf("session error: %v", trace.DebugReport(err))
 		return
 	}
 
-	pub, _, _, _, err := ssh.ParseAuthorizedKey(ws.WS.Pub)
+	pub, _, _, _, err := ssh.ParseAuthorizedKey(ws.GetPub())
 	if err != nil {
 		log.Errorf("session error: %v", trace.DebugReport(err))
 		return
@@ -333,20 +336,25 @@ func (s *AuthTunnel) handleWebAgentRequest(sconn *ssh.ServerConn, ch ssh.Channel
 func (s *AuthTunnel) onAPIConnection(sconn *ssh.ServerConn, sshChan ssh.Channel, req *sshutils.DirectTCPIPReq) {
 	defer sconn.Close()
 
-	var username string
+	var user interface{} = nil
 	if extRole, ok := sconn.Permissions.Extensions[ExtRole]; ok {
 		// retreive the role from thsi connection's permissions (make sure it's a valid role)
 		systemRole := teleport.Role(extRole)
 		if err := systemRole.Check(); err != nil {
-			log.Errorf(err.Error())
+			log.Error(err.Error())
 			return
 		}
-		username = systemRole.User()
+		user = teleport.BuiltinRole{Role: systemRole}
+	} else if clusterName, ok := sconn.Permissions.Extensions[utils.CertTeleportUserCA]; ok {
+		// we got user signed by remote certificate authority
+		user = teleport.RemoteUser{
+			ClusterName: clusterName,
+			Username:    sconn.Permissions.Extensions[utils.CertTeleportUser],
+		}
 	} else if teleportUser, ok := sconn.Permissions.Extensions[utils.CertTeleportUser]; ok {
-		username = teleportUser
-		if teleport.IsSystemUsername(username) {
-			log.Errorf("%v is a system reserved username, but certificate does not verify", username)
-			return
+		// we got user signed by local certificate authority
+		user = teleport.LocalUser{
+			Username: teleportUser,
 		}
 	} else {
 		log.Errorf("expected %v or %v extensions for %v, found none in %v", ExtRole, utils.CertTeleportUser, sconn.User(), sconn.Permissions.Extensions)
@@ -377,8 +385,7 @@ func (s *AuthTunnel) onAPIConnection(sconn *ssh.ServerConn, sshChan ssh.Channel,
 	// serve HTTP API via this SSH connection until it gets closed:
 	http.Serve(&socket, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// take SSH client name and pass it to HTTP API via HTTP Auth
-		r.SetBasicAuth(username, "")
-		api.ServeHTTP(w, r)
+		api.ServeHTTP(w, r.WithContext(context.WithValue(context.TODO(), teleport.ContextUser, user)))
 	}))
 }
 
@@ -417,17 +424,46 @@ func (s *AuthTunnel) keyAuth(
 			conn.RemoteAddr(), conn.LocalAddr(), conn.User(), conn.User(), err)
 		return nil, trace.Wrap(err)
 	}
-	// we are not using cert extensions for User certificates because of OpenSSH bug
-	// https://bugzilla.mindrot.org/show_bug.cgi?id=2387
-	perms := &ssh.Permissions{
-		Extensions: map[string]string{
-			ExtHost:                conn.User(),
-			utils.CertTeleportUser: cert.KeyId,
-		},
+
+	ca, err := s.findUserAuthority(cert.SignatureKey)
+	if err != nil {
+		log.Warningf("conn(%v->%v, user=%v) ERROR: Failed to authorize user %v, err: %v",
+			conn.RemoteAddr(), conn.LocalAddr(), conn.User(), conn.User(), err)
+		return nil, trace.Wrap(err)
 	}
-	return perms, nil
+
+	clusterName, err := s.authServer.GetDomainName()
+	if err != nil {
+		log.Warningf("conn(%v->%v, user=%v) ERROR: Failed to authorize user %v, err: %v",
+			conn.RemoteAddr(), conn.LocalAddr(), conn.User(), conn.User(), err)
+		return nil, trace.Wrap(err)
+	}
+
+	// if this is local CA, we assume that local user exists
+	if clusterName == ca.GetClusterName() {
+		// we are not using cert extensions for User certificates because of OpenSSH bug
+		// https://bugzilla.mindrot.org/show_bug.cgi?id=2387
+		return &ssh.Permissions{
+			Extensions: map[string]string{
+				ExtHost:                conn.User(),
+				utils.CertTeleportUser: cert.KeyId,
+			},
+		}, nil
+	}
+	// otherwise we return this as a remote CA
+	return &ssh.Permissions{
+		Extensions: map[string]string{
+			ExtHost:                  conn.User(),
+			utils.CertTeleportUserCA: ca.GetID().DomainName,
+			utils.CertTeleportUser:   cert.KeyId,
+		},
+	}, nil
 }
 
+// passwordAuth is called to authenticate an incoming SSH connection
+// to the auth server. Such connections are usually created using a
+// TunClient object
+//
 func (s *AuthTunnel) passwordAuth(
 	conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 	var ab *authBucket
@@ -438,6 +474,7 @@ func (s *AuthTunnel) passwordAuth(
 	log.Infof("[AUTH] login attempt: user %q type %q", conn.User(), ab.Type)
 
 	switch ab.Type {
+	// regular user is trying to get in using his password+OTP token:
 	case AuthWebPassword:
 		if err := s.authServer.CheckPassword(conn.User(), ab.Pass, ab.OTPToken); err != nil {
 			return nil, trace.Wrap(err)
@@ -702,19 +739,24 @@ func (c *TunClient) GetDialer() AccessPointDialer {
 	}
 }
 
-// GetAgent returns SSH agent that uses ReqWebSessionAgent Auth server extension
+// GetAgent creates an SSH key agent (similar object to what CLI uses), this
+// key agent fetches user keys directly from the auth server using a custom channel
+// created via "ReqWebSessionAgent" reguest
 func (c *TunClient) GetAgent() (AgentCloser, error) {
 	client, err := c.getClient() // we need an established connection first
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+	// create a special SSH channel into the auth server, which will be used to
+	// serve user keys to a web-based terminal client (which will be using the
+	// returned SSH agent)
 	ch, _, err := client.OpenChannel(ReqWebSessionAgent, nil)
 	if err != nil {
 		return nil, trace.ConnectionProblem(err, "failed to connect to remote API")
 	}
-	agentCloser := &tunAgent{client: client}
-	agentCloser.Agent = agent.NewClient(ch)
-	return agentCloser, nil
+	ta := &tunAgent{client: client}
+	ta.Agent = agent.NewClient(ch)
+	return ta, nil
 }
 
 // Dial dials to Auth server's HTTP API over SSH tunnel.
@@ -876,6 +918,9 @@ type AgentCloser interface {
 	agent.Agent
 }
 
+// tunAgent is an SSH key agent (as defined by golang lib) implemented on top
+// of the tun client. It allows secure retreival of user credentials from the
+// auth server API.
 type tunAgent struct {
 	agent.Agent
 	client *ssh.Client

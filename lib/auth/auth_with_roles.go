@@ -122,11 +122,6 @@ func (a *AuthWithRoles) GetDomainName() (string, error) {
 	return a.authServer.GetDomainName()
 }
 
-func (a *AuthWithRoles) GetU2FAppID() (string, error) {
-	// authenticated users can all read this
-	return a.authServer.GetU2FAppID()
-}
-
 func (a *AuthWithRoles) DeleteCertAuthority(id services.CertAuthID) error {
 	if err := a.action(defaults.Namespace, services.KindCertAuthority, services.ActionWrite); err != nil {
 		return trace.Wrap(err)
@@ -141,9 +136,9 @@ func (a *AuthWithRoles) GenerateToken(roles teleport.Roles, ttl time.Duration) (
 	return a.authServer.GenerateToken(roles, ttl)
 }
 
-func (a *AuthWithRoles) RegisterUsingToken(token, hostID string, role teleport.Role) (*PackedKeys, error) {
+func (a *AuthWithRoles) RegisterUsingToken(token, hostID string, nodeName string, role teleport.Role) (*PackedKeys, error) {
 	// tokens have authz mechanism  on their own, no need to check
-	return a.authServer.RegisterUsingToken(token, hostID, role)
+	return a.authServer.RegisterUsingToken(token, hostID, nodeName, role)
 }
 
 func (a *AuthWithRoles) RegisterNewAuthServer(token string) error {
@@ -270,14 +265,14 @@ func (a *AuthWithRoles) GetOTPData(user string) (string, []byte, error) {
 	return a.authServer.GetOTPData(user)
 }
 
-func (a *AuthWithRoles) SignIn(user string, password []byte) (*Session, error) {
+func (a *AuthWithRoles) SignIn(user string, password []byte) (services.WebSession, error) {
 	if err := a.currentUserAction(user); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.SignIn(user, password)
 }
 
-func (a *AuthWithRoles) PreAuthenticatedSignIn(user string) (*Session, error) {
+func (a *AuthWithRoles) PreAuthenticatedSignIn(user string) (services.WebSession, error) {
 	if err := a.currentUserAction(user); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -290,21 +285,21 @@ func (a *AuthWithRoles) GetU2FSignRequest(user string, password []byte) (*u2f.Si
 	return a.authServer.U2FSignRequest(user, password)
 }
 
-func (a *AuthWithRoles) CreateWebSession(user string) (*Session, error) {
+func (a *AuthWithRoles) CreateWebSession(user string) (services.WebSession, error) {
 	if err := a.currentUserAction(user); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.CreateWebSession(user)
 }
 
-func (a *AuthWithRoles) ExtendWebSession(user, prevSessionID string) (*Session, error) {
+func (a *AuthWithRoles) ExtendWebSession(user, prevSessionID string) (services.WebSession, error) {
 	if err := a.action(defaults.Namespace, services.KindWebSession, services.ActionWrite); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.ExtendWebSession(user, prevSessionID)
 }
 
-func (a *AuthWithRoles) GetWebSessionInfo(user string, sid string) (*Session, error) {
+func (a *AuthWithRoles) GetWebSessionInfo(user string, sid string) (services.WebSession, error) {
 	if err := a.action(defaults.Namespace, services.KindWebSession, services.ActionRead); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -347,25 +342,39 @@ func (a *AuthWithRoles) GenerateKeyPair(pass string) ([]byte, []byte, error) {
 }
 
 func (a *AuthWithRoles) GenerateHostCert(
-	key []byte, hostname, authDomain string, roles teleport.Roles,
+	key []byte, hostID, nodeName, clusterName string, roles teleport.Roles,
 	ttl time.Duration) ([]byte, error) {
 
 	if err := a.action(defaults.Namespace, services.KindHostCert, services.ActionWrite); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return a.authServer.GenerateHostCert(key, hostname, authDomain, roles, ttl)
+	return a.authServer.GenerateHostCert(key, hostID, nodeName, clusterName, roles, ttl)
 }
 
-func (a *AuthWithRoles) GenerateUserCert(key []byte, user string, ttl time.Duration) ([]byte, error) {
-	if err := a.currentUserAction(user); err != nil {
-		return nil, trace.AccessDenied("%v cannot request a certificate for %v", a.user, user)
+func (a *AuthWithRoles) GenerateUserCert(key []byte, username string, ttl time.Duration) ([]byte, error) {
+	if err := a.currentUserAction(username); err != nil {
+		return nil, trace.AccessDenied("%v cannot request a certificate for %v", a.user, username)
+	}
+	// notice that user requesting the certificate and the user currently
+	// authenticated may differ (e.g. admin generates certificate for the user scenario)
+	// so we fetch user's permissions
+	checker := a.checker
+	if a.user != username {
+		user, err := a.GetUser(username)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		checker, err = services.FetchRoles(user.GetRoles(), a.authServer)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 	// check signing TTL and return a list of allowed logins
-	allowedLogins, err := a.checker.CheckLogins(ttl)
+	allowedLogins, err := checker.CheckLogins(ttl)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return a.authServer.GenerateUserCert(key, user, allowedLogins, ttl)
+	return a.authServer.GenerateUserCert(key, username, allowedLogins, ttl)
 }
 
 func (a *AuthWithRoles) CreateSignupToken(user services.UserV1) (token string, e error) {
@@ -390,12 +399,12 @@ func (a *AuthWithRoles) GetSignupU2FRegisterRequest(token string) (u2fRegisterRe
 	return a.authServer.CreateSignupU2FRegisterRequest(token)
 }
 
-func (a *AuthWithRoles) CreateUserWithToken(token, password, hotpToken string) (*Session, error) {
+func (a *AuthWithRoles) CreateUserWithToken(token, password, hotpToken string) (services.WebSession, error) {
 	// tokens are their own authz mechanism, no need to double check
 	return a.authServer.CreateUserWithToken(token, password, hotpToken)
 }
 
-func (a *AuthWithRoles) CreateUserWithU2FToken(token string, password string, u2fRegisterResponse u2f.RegisterResponse) (*Session, error) {
+func (a *AuthWithRoles) CreateUserWithU2FToken(token string, password string, u2fRegisterResponse u2f.RegisterResponse) (services.WebSession, error) {
 	// signup tokens are their own authz resource
 	return a.authServer.CreateUserWithU2FToken(token, password, u2fRegisterResponse)
 }
@@ -417,7 +426,7 @@ func (a *AuthWithRoles) UpsertOIDCConnector(connector services.OIDCConnector, tt
 	if err := a.action(defaults.Namespace, services.KindOIDC, services.ActionWrite); err != nil {
 		return trace.Wrap(err)
 	}
-	return a.authServer.Identity.UpsertOIDCConnector(connector, ttl)
+	return a.authServer.UpsertOIDCConnector(connector, ttl)
 }
 
 func (a *AuthWithRoles) GetOIDCConnector(id string, withSecrets bool) (services.OIDCConnector, error) {
@@ -462,7 +471,7 @@ func (a *AuthWithRoles) DeleteOIDCConnector(connectorID string) error {
 	if err := a.action(defaults.Namespace, services.KindOIDC, services.ActionWrite); err != nil {
 		return trace.Wrap(err)
 	}
-	return a.authServer.Identity.DeleteOIDCConnector(connectorID)
+	return a.authServer.DeleteOIDCConnector(connectorID)
 }
 
 func (a *AuthWithRoles) EmitAuditEvent(eventType string, fields events.EventFields) error {
@@ -562,6 +571,42 @@ func (a *AuthWithRoles) DeleteRole(name string) error {
 		return trace.Wrap(err)
 	}
 	return a.authServer.DeleteRole(name)
+}
+
+func (a *AuthWithRoles) GetClusterAuthPreference() (services.AuthPreference, error) {
+	err := a.action(defaults.Namespace, services.KindClusterAuthPreference, services.ActionRead)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return a.authServer.GetClusterAuthPreference()
+}
+
+func (a *AuthWithRoles) SetClusterAuthPreference(cap services.AuthPreference) error {
+	err := a.action(defaults.Namespace, services.KindClusterAuthPreference, services.ActionWrite)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	return a.authServer.SetClusterAuthPreference(cap)
+}
+
+func (a *AuthWithRoles) GetUniversalSecondFactor() (services.UniversalSecondFactor, error) {
+	err := a.action(defaults.Namespace, services.KindUniversalSecondFactor, services.ActionRead)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return a.authServer.GetUniversalSecondFactor()
+}
+
+func (a *AuthWithRoles) SetUniversalSecondFactor(u2f services.UniversalSecondFactor) error {
+	err := a.action(defaults.Namespace, services.KindUniversalSecondFactor, services.ActionWrite)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	return a.authServer.SetUniversalSecondFactor(u2f)
 }
 
 // NewAuthWithRoles creates new auth server with access control

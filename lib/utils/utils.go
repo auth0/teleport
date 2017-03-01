@@ -193,11 +193,23 @@ func Deduplicate(in []string) []string {
 	return out
 }
 
+// SliceContainsStr returns 'true' if the slice contains the given value
+func SliceContainsStr(slice []string, value string) bool {
+	for i := range slice {
+		if slice[i] == value {
+			return true
+		}
+	}
+	return false
+}
+
 const (
 	// HumanTimeFormatString is a human readable date formatting
 	HumanTimeFormatString = "Mon Jan _2 15:04 UTC"
 	// CertTeleportUser specifies teleport user
 	CertTeleportUser = "x-teleport-user"
+	// CertTeleportUserCA specifies teleport certificate authority
+	CertTeleportUserCA = "x-teleport-user-ca"
 	// CertExtensionRole specifies teleport role
 	CertExtensionRole = "x-teleport-role"
 	// CertExtensionAuthority specifies teleport authority's name

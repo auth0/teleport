@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -61,10 +62,10 @@ type proxySubsys struct {
 func parseProxySubsys(name string, srv *Server) (*proxySubsys, error) {
 	log.Debugf("parse_proxy_subsys(%s)", name)
 	var (
-		siteName   string
-		host       string
-		port       string
-		paramError = trace.BadParameter("invalid format for proxy request: '%v', expected 'proxy:host:port@site'", name)
+		clusterName string
+		host        string
+		port        string
+		paramError  = trace.BadParameter("invalid format for proxy request: '%v', expected 'proxy:host:port@site'", name)
 	)
 	const prefix = "proxy:"
 	// get rid of 'proxy:' prefix:
@@ -77,23 +78,22 @@ func parseProxySubsys(name string, srv *Server) (*proxySubsys, error) {
 	parts := strings.Split(name, "@")
 	switch len(parts) {
 	case 2:
-		siteName = strings.Join(parts[1:], "@")
+		clusterName = strings.Join(parts[1:], "@")
 		name = parts[0]
 	case 3:
-		siteName = strings.Join(parts[2:], "@")
+		clusterName = strings.Join(parts[2:], "@")
 		namespace = parts[1]
 		name = parts[0]
 	}
 	// find host & port in the arguments:
 	host, port, err := net.SplitHostPort(name)
-	if siteName == "" && err != nil {
+	if clusterName == "" && err != nil {
 		return nil, trace.Wrap(paramError)
 	}
-	// validate siteName
-	if siteName != "" && srv.proxyTun != nil {
-		_, err := srv.proxyTun.GetSite(siteName)
+	if clusterName != "" && srv.proxyTun != nil {
+		_, err := srv.proxyTun.GetSite(clusterName)
 		if err != nil {
-			return nil, trace.BadParameter("unknown site '%s'", siteName)
+			return nil, trace.BadParameter("unknown cluster '%s'", clusterName)
 		}
 	}
 
@@ -102,7 +102,7 @@ func parseProxySubsys(name string, srv *Server) (*proxySubsys, error) {
 		srv:       srv,
 		host:      host,
 		port:      port,
-		siteName:  siteName,
+		siteName:  clusterName,
 		closeC:    make(chan struct{}),
 	}, nil
 }
@@ -122,6 +122,17 @@ func (t *proxySubsys) start(sconn *ssh.ServerConn, ch ssh.Channel, req *ssh.Requ
 		tunnel     = t.srv.proxyTun
 		clientAddr = sconn.RemoteAddr()
 	)
+	// did the client pass us a true client IP ahead of time via an environment variable?
+	// (usually the web client would do that)
+	ctx.Lock()
+	trueClientIP, ok := ctx.env[sshutils.TrueClientAddrVar]
+	ctx.Unlock()
+	if ok {
+		a, err := utils.ParseAddr(trueClientIP)
+		if err == nil {
+			clientAddr = a
+		}
+	}
 	// get the site by name:
 	if t.siteName != "" {
 		site, err = tunnel.GetSite(t.siteName)
@@ -232,23 +243,38 @@ func (t *proxySubsys) proxyToHost(
 			}
 		}
 	}
-	// enumerate and try to find a server with a matching name
-	serverAddr := net.JoinHostPort(t.host, t.port)
+
+	// if port is 0, it means the client wants us to figure out
+	// which port to use
+	useExactPort := len(t.port) > 0 && t.port != "0"
+	ips, _ := net.LookupHost(t.host)
+
+	// enumerate and try to find a server with self-registered with a matching name/IP:
 	var server services.Server
 	for i := range servers {
 		ip, port, err := net.SplitHostPort(servers[i].GetAddr())
 		if err != nil {
-			return trace.Wrap(err)
+			log.Error(err)
+			continue
 		}
-
-		// match either by hostname of ip, based on the match
-		if (t.host == ip || t.host == servers[i].GetHostname()) && port == t.port {
+		if t.host == ip || t.host == servers[i].GetHostname() || utils.SliceContainsStr(ips, ip) {
 			server = servers[i]
+			// found the server. see if we need to match the port
+			if useExactPort && t.port != port {
+				return trace.BadParameter("host %s is listening on port %s, not %s", t.host, port, t.port)
+			}
 			break
 		}
 	}
+
+	var serverAddr string
 	if server != nil {
 		serverAddr = server.GetAddr()
+	} else {
+		if !useExactPort {
+			t.port = strconv.Itoa(defaults.SSHServerListenPort)
+		}
+		serverAddr = net.JoinHostPort(t.host, t.port)
 	}
 
 	// we must dial by server IP address because hostname
@@ -257,7 +283,7 @@ func (t *proxySubsys) proxyToHost(
 		remoteAddr,
 		&utils.NetAddr{Addr: serverAddr, AddrNetwork: "tcp"})
 	if err != nil {
-		return trace.ConvertSystemError(err)
+		return trace.Wrap(err)
 	}
 
 	// this custom SSH handshake allows SSH proxy to relay the client's IP

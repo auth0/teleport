@@ -55,29 +55,14 @@ type Authority interface {
 	// GetNewKeyPairFromPool returns new keypair from pre-generated in memory pool
 	GetNewKeyPairFromPool() (privKey []byte, pubKey []byte, err error)
 
-	// GenerateHostCert generates host certificate, it takes pkey as a signing
-	// private key (host certificate authority)
-	GenerateHostCert(pkey, key []byte, hostID, authDomain string, roles teleport.Roles, ttl time.Duration) ([]byte, error)
+	// GenerateHostCert takes the private key of the CA, public key of the new host,
+	// along with metadata (host ID, node name, cluster name, roles, and ttl) and generates
+	// a host certificate.
+	GenerateHostCert(certParams services.CertParams) ([]byte, error)
 
 	// GenerateUserCert generates user certificate, it takes pkey as a signing
 	// private key (user certificate authority)
 	GenerateUserCert(pkey, key []byte, teleportUsername string, allowedLogins []string, ttl time.Duration) ([]byte, error)
-}
-
-// Session is a web session context, stores temporary key-value pair and session id
-type Session struct {
-	// ID is a session ID
-	ID string `json:"id"`
-	// Username is a user this session belongs to
-	Username string `json:"username"`
-	// ExpiresAt is an optional expiry time, if set
-	// that means this web session and all derived web sessions
-	// can not continue after this time, used in OIDC use case
-	// when expiry is set by external identity provider, so user
-	// has to relogin (or later on we'd need to refresh the token)
-	ExpiresAt time.Time `json:"expires_at"`
-	// WS is a private keypair used for signing requests
-	WS services.WebSession `json:"web"`
 }
 
 // AuthServerOption allows setting options as functional arguments to AuthServer
@@ -100,19 +85,27 @@ func NewAuthServer(cfg *InitConfig, opts ...AuthServerOption) *AuthServer {
 	if cfg.Access == nil {
 		cfg.Access = local.NewAccessService(cfg.Backend)
 	}
+	if cfg.ClusterAuthPreferenceService == nil {
+		cfg.ClusterAuthPreferenceService = local.NewClusterAuthPreferenceService(cfg.Backend)
+	}
+	if cfg.UniversalSecondFactorService == nil {
+		cfg.UniversalSecondFactorService = local.NewUniversalSecondFactorService(cfg.Backend)
+	}
+
 	as := AuthServer{
-		bk:              cfg.Backend,
-		Authority:       cfg.Authority,
-		Trust:           cfg.Trust,
-		Presence:        cfg.Presence,
-		Provisioner:     cfg.Provisioner,
-		Identity:        cfg.Identity,
-		Access:          cfg.Access,
-		DomainName:      cfg.DomainName,
-		AuthServiceName: cfg.AuthServiceName,
-		oidcClients:     make(map[string]*oidc.Client),
-		StaticTokens:    cfg.StaticTokens,
-		U2F:             cfg.U2F,
+		bk:                            cfg.Backend,
+		Authority:                     cfg.Authority,
+		Trust:                         cfg.Trust,
+		Presence:                      cfg.Presence,
+		Provisioner:                   cfg.Provisioner,
+		Identity:                      cfg.Identity,
+		Access:                        cfg.Access,
+		DomainName:                    cfg.DomainName,
+		AuthServiceName:               cfg.AuthServiceName,
+		StaticTokens:                  cfg.StaticTokens,
+		ClusterAuthPreference:         cfg.ClusterAuthPreferenceService,
+		UniversalSecondFactorSettings: cfg.UniversalSecondFactorService,
+		oidcClients:                   make(map[string]*oidcClient),
 	}
 	for _, o := range opts {
 		o(&as)
@@ -132,7 +125,7 @@ func NewAuthServer(cfg *InitConfig, opts ...AuthServerOption) *AuthServer {
 //   - checks public keys to see if they're signed by it (can be trusted or not)
 type AuthServer struct {
 	lock        sync.Mutex
-	oidcClients map[string]*oidc.Client
+	oidcClients map[string]*oidcClient
 	clock       clockwork.Clock
 	bk          backend.Backend
 	Authority
@@ -150,14 +143,13 @@ type AuthServer struct {
 	// environments where paranoid security is not needed
 	StaticTokens []services.ProvisionToken
 
-	// U2F is the configuration of the U2F 2 factor authentication
-	U2F services.U2F
-
 	services.Trust
 	services.Presence
 	services.Provisioner
 	services.Identity
 	services.Access
+	services.ClusterAuthPreference
+	services.UniversalSecondFactorSettings
 }
 
 func (a *AuthServer) Close() error {
@@ -173,23 +165,10 @@ func (a *AuthServer) GetDomainName() (string, error) {
 	return a.DomainName, nil
 }
 
-func (a *AuthServer) GetU2FAppID() (string, error) {
-	if err := a.CheckU2FEnabled(); err != nil {
-		return "", trace.Wrap(err)
-	}
-	return a.U2F.AppID, nil
-}
-
-func (a *AuthServer) CheckU2FEnabled() error {
-	if !a.U2F.Enabled {
-		return trace.AccessDenied("U2F is disabled")
-	}
-	return nil
-}
-
-// GenerateHostCert generates host certificate, it takes pkey as a signing
-// private key (host certificate authority)
-func (s *AuthServer) GenerateHostCert(key []byte, hostID, authDomain string, roles teleport.Roles, ttl time.Duration) ([]byte, error) {
+// GenerateHostCert uses the private key of the CA to sign the public key of the host
+// (along with meta data like host ID, node name, roles, and ttl) to generate a host certificate.
+func (s *AuthServer) GenerateHostCert(hostPublicKey []byte, hostID, nodeName, clusterName string, roles teleport.Roles, ttl time.Duration) ([]byte, error) {
+	// get the certificate authority that will be signing the public key of the host
 	ca, err := s.Trust.GetCertAuthority(services.CertAuthID{
 		Type:       services.HostCA,
 		DomainName: s.DomainName,
@@ -197,11 +176,23 @@ func (s *AuthServer) GenerateHostCert(key []byte, hostID, authDomain string, rol
 	if err != nil {
 		return nil, trace.BadParameter("failed to load host CA for '%s': %v", s.DomainName, err)
 	}
-	privateKey, err := ca.FirstSigningKey()
+
+	// get the private key of the certificate authority
+	caPrivateKey, err := ca.FirstSigningKey()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return s.Authority.GenerateHostCert(privateKey, key, hostID, authDomain, roles, ttl)
+
+	// create and sign!
+	return s.Authority.GenerateHostCert(services.CertParams{
+		PrivateCASigningKey: caPrivateKey,
+		PublicHostKey:       hostPublicKey,
+		HostID:              hostID,
+		NodeName:            nodeName,
+		ClusterName:         clusterName,
+		Roles:               roles,
+		TTL:                 ttl,
+	})
 }
 
 // GenerateUserCert generates user certificate, it takes pkey as a signing
@@ -274,7 +265,7 @@ func (s *AuthServer) withUserLock(username string, authenticateFn func() error) 
 	return trace.AccessDenied(message)
 }
 
-func (s *AuthServer) SignIn(user string, password []byte) (*Session, error) {
+func (s *AuthServer) SignIn(user string, password []byte) (services.WebSession, error) {
 	err := s.withUserLock(user, func() error {
 		return s.CheckPasswordWOToken(user, password)
 	})
@@ -286,20 +277,19 @@ func (s *AuthServer) SignIn(user string, password []byte) (*Session, error) {
 
 // PreAuthenticatedSignIn is for 2-way authentication methods like U2F where the password is
 // already checked before issueing the second factor challenge
-func (s *AuthServer) PreAuthenticatedSignIn(user string) (*Session, error) {
+func (s *AuthServer) PreAuthenticatedSignIn(user string) (services.WebSession, error) {
 	sess, err := s.NewWebSession(user)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := s.UpsertWebSession(user, sess, WebSessionTTL); err != nil {
+	if err := s.UpsertWebSession(user, sess); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	sess.WS.Priv = nil
-	return sess, nil
+	return sess.WithoutSecrets(), nil
 }
 
 func (s *AuthServer) U2FSignRequest(user string, password []byte) (*u2f.SignRequest, error) {
-	err := s.CheckU2FEnabled()
+	universalSecondFactor, err := s.GetUniversalSecondFactor()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -316,7 +306,7 @@ func (s *AuthServer) U2FSignRequest(user string, password []byte) (*u2f.SignRequ
 		return nil, trace.Wrap(err)
 	}
 
-	challenge, err := u2f.NewChallenge(s.U2F.AppID, s.U2F.Facets)
+	challenge, err := u2f.NewChallenge(universalSecondFactor.GetAppID(), universalSecondFactor.GetFacets())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -332,7 +322,8 @@ func (s *AuthServer) U2FSignRequest(user string, password []byte) (*u2f.SignRequ
 }
 
 func (s *AuthServer) CheckU2FSignResponse(user string, response *u2f.SignResponse) error {
-	err := s.CheckU2FEnabled()
+	// before trying to register a user, see U2F is actually setup on the backend
+	_, err := s.GetUniversalSecondFactor()
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -367,7 +358,7 @@ func (s *AuthServer) CheckU2FSignResponse(user string, response *u2f.SignRespons
 
 // ExtendWebSession creates a new web session for a user based on a valid previous sessionID,
 // method is used to renew the web session for a user
-func (s *AuthServer) ExtendWebSession(user string, prevSessionID string) (*Session, error) {
+func (s *AuthServer) ExtendWebSession(user string, prevSessionID string) (services.WebSession, error) {
 	prevSession, err := s.GetWebSession(user, prevSessionID)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -376,7 +367,7 @@ func (s *AuthServer) ExtendWebSession(user string, prevSessionID string) (*Sessi
 	// consider absolute expiry time that may be set for this session
 	// by some external identity serivce, so we can not renew this session
 	// any more without extra logic for renewal with external OIDC provider
-	expiresAt := prevSession.ExpiresAt
+	expiresAt := prevSession.GetExpiryTime()
 	if !expiresAt.IsZero() && expiresAt.Before(s.clock.Now().UTC()) {
 		return nil, trace.NotFound("web session has expired")
 	}
@@ -385,26 +376,33 @@ func (s *AuthServer) ExtendWebSession(user string, prevSessionID string) (*Sessi
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	sessionTTL := minTTL(toTTL(s.clock, expiresAt), WebSessionTTL)
-	sess.ExpiresAt = expiresAt
-	if err := s.UpsertWebSession(user, sess, sessionTTL); err != nil {
+	sess.SetExpiryTime(expiresAt)
+	bearerTokenTTL := utils.MinTTL(utils.ToTTL(s.clock, expiresAt), BearerTokenTTL)
+	sess.SetBearerTokenExpiryTime(s.clock.Now().UTC().Add(bearerTokenTTL))
+	if err := s.UpsertWebSession(user, sess); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	sess.WS.Priv = nil
+	sess, err = services.GetWebSessionMarshaler().ExtendWebSession(sess)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 	return sess, nil
 }
 
 // CreateWebSession creates a new web session for user without any
 // checks, is used by admins
-func (s *AuthServer) CreateWebSession(user string) (*Session, error) {
+func (s *AuthServer) CreateWebSession(user string) (services.WebSession, error) {
 	sess, err := s.NewWebSession(user)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := s.UpsertWebSession(user, sess, WebSessionTTL); err != nil {
+	if err := s.UpsertWebSession(user, sess); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	sess.WS.Priv = nil
+	sess, err = services.GetWebSessionMarshaler().GenerateWebSession(sess)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 	return sess, nil
 }
 
@@ -424,20 +422,19 @@ func (s *AuthServer) GenerateToken(roles teleport.Roles, ttl time.Duration) (str
 	return token, nil
 }
 
-// GenerateServerKeys generates private key and certificate signed
-// by the host certificate authority, listing the role of this server
-func (s *AuthServer) GenerateServerKeys(hostID string, roles teleport.Roles) (*PackedKeys, error) {
+// GenerateServerKeys generates new host private keys and certificates (signed
+// by the host certificate authority) for a node.
+func (s *AuthServer) GenerateServerKeys(hostID string, nodeName string, roles teleport.Roles) (*PackedKeys, error) {
+	// generate private key
 	k, pub, err := s.GenerateKeyPair("")
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	// we always append authority's domain to resulting node name,
-	// that's how we make sure that nodes are uniquely identified/found
-	// in cases when we have multiple environments/organizations
-	fqdn := fmt.Sprintf("%s.%s", hostID, s.DomainName)
-	c, err := s.GenerateHostCert(pub, fqdn, s.DomainName, roles, 0)
+
+	// generate host certificate with an infinite ttl
+	c, err := s.GenerateHostCert(pub, hostID, nodeName, s.DomainName, roles, 0)
 	if err != nil {
-		log.Warningf("[AUTH] Node `%v` cannot join: cert generation error. %v", hostID, err)
+		log.Warningf("[AUTH] Node %q [%v] can not join: certificate generation error: %v", nodeName, hostID, err)
 		return nil, trace.Wrap(err)
 	}
 
@@ -492,36 +489,42 @@ func (s *AuthServer) checkTokenTTL(token string) bool {
 // If a token was generated with a TTL, it gets enforced (can't register new nodes after TTL expires)
 // If a token was generated with a TTL=0, it means it's a single-use token and it gets destroyed
 // after a successful registration.
-func (s *AuthServer) RegisterUsingToken(token, hostID string, role teleport.Role) (*PackedKeys, error) {
-	log.Infof("[AUTH] Node `%v` is trying to join as %v", hostID, role)
+func (s *AuthServer) RegisterUsingToken(token, hostID string, nodeName string, role teleport.Role) (*PackedKeys, error) {
+	log.Infof("[AUTH] Node %q [%v] trying to join with role: %v", nodeName, hostID, role)
 	if hostID == "" {
 		return nil, trace.BadParameter("HostID cannot be empty")
 	}
+
 	if err := role.Check(); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	// make sure the token is valid:
+
+	// make sure the token is valid
 	roles, err := s.ValidateToken(token)
 	if err != nil {
-		msg := fmt.Sprintf("`%v` cannot join the cluster as %s. Token error: %v", hostID, role, err)
+		msg := fmt.Sprintf("%q [%v] can not join the cluster with role %s, token error: %v", nodeName, hostID, role, err)
 		log.Warnf("[AUTH] %s", msg)
 		return nil, trace.AccessDenied(msg)
 	}
-	// make sure the caller is requested wthe role allowed by the token:
+
+	// make sure the caller is requested wthe role allowed by the token
 	if !roles.Include(role) {
-		msg := fmt.Sprintf("'%v' cannot join the cluster, the token does not allow '%s' role", hostID, role)
+		msg := fmt.Sprintf("%q [%v] can not join the cluster, the token does not allow %q role", nodeName, hostID, role)
 		log.Warningf("[AUTH] %s", msg)
 		return nil, trace.BadParameter(msg)
 	}
 	if !s.checkTokenTTL(token) {
-		return nil, trace.AccessDenied("'%v' cannot join the cluster. The token has expired", hostID)
+		return nil, trace.AccessDenied("%q [%v] can not join the cluster. Token has expired", nodeName, hostID)
 	}
-	// generate & return the node cert:
-	keys, err := s.GenerateServerKeys(hostID, teleport.Roles{role})
+
+	// generate and return host certificate and keys
+	keys, err := s.GenerateServerKeys(hostID, nodeName, teleport.Roles{role})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	log.Infof("[AUTH] Node `%v` joined the cluster", hostID)
+
+	log.Infof("[AUTH] Node %q [%v] joined the cluster", nodeName, hostID)
+
 	return keys, nil
 }
 
@@ -584,7 +587,7 @@ func (s *AuthServer) GetTokens() (tokens []services.ProvisionToken, err error) {
 	return tokens, nil
 }
 
-func (s *AuthServer) NewWebSession(userName string) (*Session, error) {
+func (s *AuthServer) NewWebSession(userName string) (services.WebSession, error) {
 	token, err := utils.CryptoRandomHex(TokenLenBytes)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -620,63 +623,44 @@ func (s *AuthServer) NewWebSession(userName string) (*Session, error) {
 		}
 		roles = append(roles, role)
 	}
-	allowedLogins, err := roles.CheckLogins(WebSessionTTL)
+	sessionTTL := roles.AdjustSessionTTL(defaults.CertDuration)
+	bearerTokenTTL := utils.MinTTL(sessionTTL, BearerTokenTTL)
+
+	allowedLogins, err := roles.CheckLogins(sessionTTL)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	cert, err := s.Authority.GenerateUserCert(privateKey, pub, user.GetName(), allowedLogins, WebSessionTTL)
+	// cert TTL is set to bearer token TTL as we expect active session to renew
+	// the token every BearerTokenTTL period
+	cert, err := s.Authority.GenerateUserCert(privateKey, pub, user.GetName(), allowedLogins, bearerTokenTTL)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	sess := &Session{
-		ID:       token,
-		Username: user.GetName(),
-		WS: services.WebSession{
-			Priv:        priv,
-			Pub:         cert,
-			Expires:     s.clock.Now().UTC().Add(WebSessionTTL),
-			BearerToken: bearerToken,
-		},
-	}
-	return sess, nil
+	return services.NewWebSession(token, services.WebSessionSpecV2{
+		User:               user.GetName(),
+		Priv:               priv,
+		Pub:                cert,
+		Expires:            s.clock.Now().UTC().Add(sessionTTL),
+		BearerToken:        bearerToken,
+		BearerTokenExpires: s.clock.Now().UTC().Add(bearerTokenTTL),
+	}), nil
 }
 
-func (s *AuthServer) UpsertWebSession(user string, sess *Session, ttl time.Duration) error {
-	return s.Identity.UpsertWebSession(user, sess.ID, sess.WS, ttl)
+func (s *AuthServer) UpsertWebSession(user string, sess services.WebSession) error {
+	return s.Identity.UpsertWebSession(user, sess.GetName(), sess)
 }
 
-func (s *AuthServer) GetWebSession(userName string, id string) (*Session, error) {
-	ws, err := s.Identity.GetWebSession(userName, id)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	user, err := s.GetUser(userName)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &Session{
-		ID:       id,
-		Username: user.GetName(),
-		WS:       *ws,
-	}, nil
+func (s *AuthServer) GetWebSession(userName string, id string) (services.WebSession, error) {
+	return s.Identity.GetWebSession(userName, id)
 }
 
-func (s *AuthServer) GetWebSessionInfo(userName string, id string) (*Session, error) {
+func (s *AuthServer) GetWebSessionInfo(userName string, id string) (services.WebSession, error) {
 	sess, err := s.Identity.GetWebSession(userName, id)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	user, err := s.GetUser(userName)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	sess.Priv = nil
-	return &Session{
-		ID:       id,
-		Username: user.GetName(),
-		WS:       *sess,
-	}, nil
+	return sess.WithoutSecrets(), nil
 }
 
 func (s *AuthServer) DeleteNamespace(namespace string) error {
@@ -701,11 +685,6 @@ func (s *AuthServer) getOIDCClient(conn services.OIDCConnector) (*oidc.Client, e
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	client, ok := s.oidcClients[conn.GetName()]
-	if ok {
-		return client, nil
-	}
-
 	config := oidc.ClientConfig{
 		RedirectURL: conn.GetRedirectURL(),
 		Credentials: oidc.ClientCredentials{
@@ -716,6 +695,12 @@ func (s *AuthServer) getOIDCClient(conn services.OIDCConnector) (*oidc.Client, e
 		Scope: utils.Deduplicate(append([]string{"openid", "email"}, conn.GetScope()...)),
 	}
 
+	clientPack, ok := s.oidcClients[conn.GetName()]
+	if ok && oidcConfigsEqual(clientPack.config, config) {
+		return clientPack.client, nil
+	}
+	delete(s.oidcClients, conn.GetName())
+
 	client, err := oidc.NewClient(config)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -723,9 +708,17 @@ func (s *AuthServer) getOIDCClient(conn services.OIDCConnector) (*oidc.Client, e
 
 	client.SyncProviderConfig(conn.GetIssuerURL())
 
-	s.oidcClients[conn.GetName()] = client
+	s.oidcClients[conn.GetName()] = &oidcClient{client: client, config: config}
 
 	return client, nil
+}
+
+func (s *AuthServer) UpsertOIDCConnector(connector services.OIDCConnector, ttl time.Duration) error {
+	return s.Identity.UpsertOIDCConnector(connector, ttl)
+}
+
+func (s *AuthServer) DeleteOIDCConnector(connectorName string) error {
+	return s.Identity.DeleteOIDCConnector(connectorName)
 }
 
 func (s *AuthServer) CreateOIDCAuthRequest(req services.OIDCAuthRequest) (*services.OIDCAuthRequest, error) {
@@ -767,7 +760,7 @@ type OIDCAuthResponse struct {
 	// Identity contains validated OIDC identity
 	Identity services.OIDCIdentity `json:"identity"`
 	// Web session will be generated by auth server if requested in OIDCAuthRequest
-	Session *Session `json:"session,omitempty"`
+	Session services.WebSession `json:"session,omitempty"`
 	// Cert will be generated by certificate authority
 	Cert []byte `json:"cert,omitempty"`
 	// Req is original oidc auth request
@@ -782,6 +775,7 @@ func (a *AuthServer) createOIDCUser(connector services.OIDCConnector, ident *oid
 	if len(roles) == 0 {
 		log.Warningf("[OIDC] could not find any of expected claims: %v in the set returned by provider %v: %v",
 			strings.Join(connector.GetClaims(), ","), connector.GetName(), strings.Join(services.GetClaimNames(claims), ","))
+		return trace.AccessDenied("access denied to %v", ident.Email)
 	}
 	log.Debugf("[IDENTITY] %v/%v is a dynamic identity, generating user with roles: %v", connector.GetName(), ident.Email, roles)
 	user, err := services.GetUserMarshaler().GenerateUser(&services.UserV2{
@@ -908,26 +902,31 @@ func (a *AuthServer) ValidateOIDCAuthCallback(q url.Values) (*OIDCAuthResponse, 
 	}
 	response.Username = user.GetName()
 
+	var roles services.RoleSet
+	roles, err = services.FetchRoles(user.GetRoles(), a.Access)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	sessionTTL := roles.AdjustSessionTTL(utils.ToTTL(a.clock, ident.ExpiresAt))
+	bearerTokenTTL := utils.MinTTL(BearerTokenTTL, sessionTTL)
+
 	if req.CreateWebSession {
 		sess, err := a.NewWebSession(user.GetName())
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-		sess.ExpiresAt = ident.ExpiresAt.UTC()
-		sessionTTL := minTTL(toTTL(a.clock, ident.ExpiresAt), WebSessionTTL)
-		if err := a.UpsertWebSession(user.GetName(), sess, sessionTTL); err != nil {
+		// session will expire based on identity TTL and allowed session TTL
+		sess.SetExpiryTime(a.clock.Now().UTC().Add(sessionTTL))
+		// bearer token will expire based on the expected session renewal
+		sess.SetBearerTokenExpiryTime(a.clock.Now().UTC().Add(bearerTokenTTL))
+		if err := a.UpsertWebSession(user.GetName(), sess); err != nil {
 			return nil, trace.Wrap(err)
 		}
 		response.Session = sess
 	}
 
-	var roles services.RoleSet
 	if len(req.PublicKey) != 0 {
-		certTTL := minTTL(toTTL(a.clock, ident.ExpiresAt), req.CertTTL)
-		roles, err = services.FetchRoles(user.GetRoles(), a.Access)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
+		certTTL := utils.MinTTL(utils.ToTTL(a.clock, ident.ExpiresAt), req.CertTTL)
 		allowedLogins, err := roles.CheckLogins(certTTL)
 		if err != nil {
 			return nil, trace.Wrap(err)
@@ -980,33 +979,38 @@ func (a *AuthServer) DeleteRole(name string) error {
 }
 
 const (
-	// WebSessionTTL specifies standard web session time to live
-	WebSessionTTL = 10 * time.Minute
+	// BearerTokenTTL specifies standard bearer token to exist before
+	// it has to be renewed by the client
+	BearerTokenTTL = 10 * time.Minute
 	// TokenLenBytes is len in bytes of the invite token
 	TokenLenBytes = 16
 )
 
-// minTTL finds min non 0 TTL duration,
-// if both durations are 0, fails
-func minTTL(a, b time.Duration) time.Duration {
-	if a == 0 {
-		return b
-	}
-	if b == 0 {
-		return a
-	}
-	if a < b {
-		return a
-	}
-	return b
+// oidcClient is internal structure that stores client and it's config
+type oidcClient struct {
+	client *oidc.Client
+	config oidc.ClientConfig
 }
 
-// toTTL converts expiration time to TTL duration
-// relative to current time as provided by clock
-func toTTL(c clockwork.Clock, tm time.Time) time.Duration {
-	now := c.Now().UTC()
-	if tm.IsZero() || tm.Before(now) {
-		return 0
+// oidcConfigsEqual is a struct that helps us to verify that
+// two oidc configs are equal
+func oidcConfigsEqual(a, b oidc.ClientConfig) bool {
+	if a.RedirectURL != b.RedirectURL {
+		return false
 	}
-	return tm.Sub(now)
+	if a.Credentials.ID != b.Credentials.ID {
+		return false
+	}
+	if a.Credentials.Secret != b.Credentials.Secret {
+		return false
+	}
+	if len(a.Scope) != len(b.Scope) {
+		return false
+	}
+	for i := range a.Scope {
+		if a.Scope[i] != b.Scope[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -124,14 +124,14 @@ func (s *AuthServer) GetSignupTokenData(token string) (user string, qrCode []byt
 	// It's a TOCTOU bug in the making: https://en.wikipedia.org/wiki/Time_of_check_to_time_of_use
 	_, err = s.GetPasswordHash(tokenData.User.Name)
 	if err == nil {
-		return "", nil, trace.Errorf("can't add user %q: user already exists", tokenData.User)
+		return "", nil, trace.Errorf("can't add user %v: user already exists", tokenData.User)
 	}
 
 	return tokenData.User.Name, tokenData.OTPQRCode, nil
 }
 
 func (s *AuthServer) CreateSignupU2FRegisterRequest(token string) (u2fRegisterRequest *u2f.RegisterRequest, e error) {
-	err := s.CheckU2FEnabled()
+	universalSecondFactor, err := s.GetUniversalSecondFactor()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -143,10 +143,10 @@ func (s *AuthServer) CreateSignupU2FRegisterRequest(token string) (u2fRegisterRe
 
 	_, err = s.GetPasswordHash(tokenData.User.Name)
 	if err == nil {
-		return nil, trace.AlreadyExists("can't add user %v, user already exists", tokenData.User)
+		return nil, trace.AlreadyExists("can't add user %q, user already exists", tokenData.User)
 	}
 
-	c, err := u2f.NewChallenge(s.U2F.AppID, s.U2F.Facets)
+	c, err := u2f.NewChallenge(universalSecondFactor.GetAppID(), universalSecondFactor.GetFacets())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -164,7 +164,7 @@ func (s *AuthServer) CreateSignupU2FRegisterRequest(token string) (u2fRegisterRe
 // CreateUserWithToken creates account with provided token and password.
 // Account username and hotp generator are taken from token data.
 // Deletes token after account creation.
-func (s *AuthServer) CreateUserWithToken(token string, password string, otpToken string) (*Session, error) {
+func (s *AuthServer) CreateUserWithToken(token string, password string, otpToken string) (services.WebSession, error) {
 	tokenData, err := s.GetSignupToken(token)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -211,19 +211,19 @@ func (s *AuthServer) CreateUserWithToken(token string, password string, otpToken
 		return nil, trace.Wrap(err)
 	}
 
-	err = s.UpsertWebSession(user.GetName(), sess, WebSessionTTL)
+	err = s.UpsertWebSession(user.GetName(), sess)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	sess.WS.Priv = nil
-	return sess, nil
+	return sess.WithoutSecrets(), nil
 }
 
-func (s *AuthServer) CreateUserWithU2FToken(token string, password string, response u2f.RegisterResponse) (*Session, error) {
-	err := s.CheckU2FEnabled()
+func (s *AuthServer) CreateUserWithU2FToken(token string, password string, response u2f.RegisterResponse) (services.WebSession, error) {
+	// before trying to create a user, see U2F is actually setup on the backend
+	_, err := s.GetUniversalSecondFactor()
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, err
 	}
 
 	tokenData, err := s.GetSignupToken(token)
@@ -281,13 +281,12 @@ func (s *AuthServer) CreateUserWithU2FToken(token string, password string, respo
 		return nil, trace.Wrap(err)
 	}
 
-	err = s.UpsertWebSession(user.GetName(), sess, WebSessionTTL)
+	err = s.UpsertWebSession(user.GetName(), sess)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	sess.WS.Priv = nil
-	return sess, nil
+	return sess.WithoutSecrets(), nil
 }
 
 func (a *AuthServer) DeleteUser(user string) error {
